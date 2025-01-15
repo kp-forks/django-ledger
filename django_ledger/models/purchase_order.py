@@ -2,10 +2,6 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
-    * Pranav P Tulshyan <Ptulshyan77@gmail.com>
-
 A purchase order is a commercial source document that is issued by a business purchasing department when placing an
 order with its vendors or suppliers. The document indicates the details on the items that are to be purchased, such as
 the types of goods, quantity, and price. In simple terms, it is the contract drafted by the buyer when purchasing goods
@@ -25,18 +21,26 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from django.core.validators import MinLengthValidator
 from django.db import models, transaction, IntegrityError
-from django.db.models import Q, Sum, Count, F
+from django.db.models import Q, Sum, Count, F, Manager, QuerySet
 from django.db.models.functions import Coalesce
 from django.db.models.signals import pre_save
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
-from django.utils.timezone import localdate
 from django.utils.translation import gettext_lazy as _
 
+from django_ledger.io.io_core import get_localdate
 from django_ledger.models.bill import BillModel, BillModelQuerySet
 from django_ledger.models.entity import EntityModel
 from django_ledger.models.items import ItemTransactionModel, ItemTransactionModelQuerySet, ItemModelQuerySet, ItemModel
 from django_ledger.models.mixins import CreateUpdateMixIn, MarkdownNotesMixIn, ItemizeMixIn
+from django_ledger.models.signals import (
+    po_status_draft,
+    po_status_void,
+    po_status_fulfilled,
+    po_status_approved,
+    po_status_canceled,
+    po_status_in_review
+)
 from django_ledger.models.utils import lazy_loader
 from django_ledger.settings import DJANGO_LEDGER_DOCUMENT_NUMBER_PADDING, DJANGO_LEDGER_PO_NUMBER_PREFIX
 
@@ -49,7 +53,7 @@ class PurchaseOrderModelValidationError(ValidationError):
     pass
 
 
-class PurchaseOrderModelQuerySet(models.QuerySet):
+class PurchaseOrderModelQuerySet(QuerySet):
     """
     A custom defined PurchaseOrderModel QuerySet.
     """
@@ -96,10 +100,19 @@ class PurchaseOrderModelQuerySet(models.QuerySet):
         return self.filter(po_status__exact=PurchaseOrderModel.PO_STATUS_DRAFT)
 
 
-class PurchaseOrderModelManager(models.Manager):
+class PurchaseOrderModelManager(Manager):
     """
     A custom defined PurchaseOrderModel Manager.
     """
+
+    def for_user(self, user_model):
+        qs = self.get_queryset()
+        if user_model.is_superuser:
+            return qs
+        return qs.filter(
+            Q(entity__admin=user_model) |
+            Q(entity__managers__in=[user_model])
+        )
 
     def for_entity(self, entity_slug, user_model) -> PurchaseOrderModelQuerySet:
         """
@@ -111,15 +124,10 @@ class PurchaseOrderModelManager(models.Manager):
         PurchaseOrderModelQuerySet
             A PurchaseOrderModelQuerySet with applied filters.
         """
-        qs = self.get_queryset()
+        qs = self.for_user(user_model)
         if isinstance(entity_slug, EntityModel):
             qs = qs.filter(entity=entity_slug)
-        elif isinstance(entity_slug, str):
-            qs = qs.filter(entity__slug__exact=entity_slug)
-        return qs.filter(
-            Q(entity__admin=user_model) |
-            Q(entity__managers__in=[user_model])
-        )
+        return qs.filter(entity__slug__exact=entity_slug)
 
 
 class PurchaseOrderModelAbstract(CreateUpdateMixIn,
@@ -300,7 +308,7 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
             else:
                 raise PurchaseOrderModelValidationError('entity_slug must be an instance of str or EntityModel')
 
-            self.date_draft = localdate() if not draft_date else draft_date
+            self.date_draft = get_localdate() if not draft_date else draft_date
             self.po_status = PurchaseOrderModel.PO_STATUS_DRAFT
 
             if estimate_model:
@@ -399,9 +407,8 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
         } if not lazy_agg else None
 
     # ### ItemizeMixIn implementation END...
-    def update_state(self,
-                     itemtxs_qs: Optional[Union[ItemTransactionModelQuerySet, List[ItemTransactionModel]]] = None
-                     ) -> Tuple:
+    def update_state(self, itemtxs_qs: Optional[
+        Union[ItemTransactionModelQuerySet, List[ItemTransactionModel]]] = None) -> Tuple:
 
         """
         Updates the state of the PurchaseOrderModel.
@@ -685,13 +692,17 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
             raise PurchaseOrderModelValidationError(
                 message=f'Purchase Order {self.po_number} cannot be marked as draft.')
         self.po_status = self.PO_STATUS_DRAFT
-        self.date_draft = localdate() if not date_draft else date_draft
+        self.date_draft = get_localdate() if not date_draft else date_draft
         self.clean()
         if commit:
             self.save(update_fields=[
                 'po_status',
                 'updated'
             ])
+        po_status_draft.send_robust(sender=self.__class__,
+                                    instance=self,
+                                    commited=commit,
+                                    **kwargs)
 
     def get_mark_as_draft_html_id(self):
         """
@@ -752,7 +763,7 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
         if not self.po_amount:
             raise PurchaseOrderModelValidationError(message='PO amount is zero.')
 
-        self.date_in_review = localdate() if not date_in_review else date_in_review
+        self.date_in_review = get_localdate() if not date_in_review else date_in_review
         self.po_status = self.PO_STATUS_REVIEW
         self.clean()
         if commit:
@@ -761,6 +772,10 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
                 'date_in_review',
                 'updated'
             ])
+        po_status_in_review.send_robust(sender=self.__class__,
+                                        instance=self,
+                                        commited=commit,
+                                        **kwargs)
 
     def get_mark_as_review_html_id(self):
         """
@@ -814,7 +829,7 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
         if not self.can_approve():
             raise PurchaseOrderModelValidationError(
                 message=f'Purchase Order {self.po_number} cannot be marked as approved.')
-        self.date_approved = localdate() if not date_approved else date_approved
+        self.date_approved = get_localdate() if not date_approved else date_approved
         self.po_status = self.PO_STATUS_APPROVED
         self.clean()
         if commit:
@@ -824,6 +839,10 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
                 'po_status',
                 'updated'
             ])
+        po_status_approved.send_robust(sender=self.__class__,
+                                       instance=self,
+                                       commited=commit,
+                                       **kwargs)
 
     def get_mark_as_approved_html_id(self):
         """
@@ -877,7 +896,7 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
         if not self.can_cancel():
             raise PurchaseOrderModelValidationError(
                 message=f'Purchase Order {self.po_number} cannot be marked as canceled.')
-        self.date_canceled = localdate() if not date_canceled else date_canceled
+        self.date_canceled = get_localdate() if not date_canceled else date_canceled
         self.po_status = self.PO_STATUS_CANCELED
         self.clean()
         if commit:
@@ -886,6 +905,10 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
                 'date_canceled',
                 'updated'
             ])
+        po_status_canceled.send_robust(sender=self.__class__,
+                                       instance=self,
+                                       commited=commit,
+                                       **kwargs)
 
     def get_mark_as_canceled_html_id(self):
         """
@@ -951,7 +974,7 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
         if not po_items:
             po_items, po_items_agg = self.get_itemtxs_data(queryset=po_items)
 
-        self.date_fulfilled = localdate() if not date_fulfilled else date_fulfilled
+        self.date_fulfilled = get_localdate() if not date_fulfilled else date_fulfilled
         self.po_amount_received = self.po_amount
 
         bill_models = [i.bill_model for i in po_items]
@@ -979,6 +1002,10 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
                 'po_status',
                 'updated'
             ])
+        po_status_fulfilled.send_robust(sender=self.__class__,
+                                        instance=self,
+                                        commited=commit,
+                                        **kwargs)
 
     def get_mark_as_fulfilled_html_id(self):
         """
@@ -1043,7 +1070,7 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
         if not all(b.is_void() for b in bill_model_qs):
             raise PurchaseOrderModelValidationError('Must void all PO bills before PO can be voided.')
 
-        self.date_void = localdate() if not void_date else void_date
+        self.date_void = get_localdate() if not void_date else void_date
         self.po_status = self.PO_STATUS_VOID
         self.clean()
 
@@ -1053,6 +1080,10 @@ class PurchaseOrderModelAbstract(CreateUpdateMixIn,
                 'po_status',
                 'updated'
             ])
+        po_status_void.send_robust(sender=self.__class__,
+                                   instance=self,
+                                   commited=commit,
+                                   **kwargs)
 
     def get_mark_as_void_html_id(self):
         """
@@ -1201,6 +1232,10 @@ class PurchaseOrderModel(PurchaseOrderModelAbstract):
     """
     Purchase Order Base Model
     """
+
+    class Meta(PurchaseOrderModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_PURCHASE_ORDER_MODEL'
+        abstract = False
 
 
 def purchaseordermodel_presave(instance: PurchaseOrderModel, **kwargs):

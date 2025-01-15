@@ -3,7 +3,7 @@ Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
 Contributions to this module:
-Miguel Sanda <msanda@arrobalytics.com>
+    * Miguel Sanda <msanda@arrobalytics.com>
 """
 
 from django.contrib import messages
@@ -11,7 +11,6 @@ from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.http import HttpResponseRedirect, HttpResponseNotFound, HttpResponseForbidden
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
-from django.utils.timezone import localdate
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import (UpdateView, CreateView, DeleteView, MonthArchiveView,
                                   ArchiveIndexView, YearArchiveView, DetailView, RedirectView)
@@ -22,6 +21,7 @@ from django_ledger.forms.invoice import (BaseInvoiceModelUpdateForm, InvoiceMode
                                          DraftInvoiceModelUpdateForm, InReviewInvoiceModelUpdateForm,
                                          ApprovedInvoiceModelUpdateForm, PaidInvoiceModelUpdateForm,
                                          AccruedAndApprovedInvoiceModelUpdateForm, InvoiceModelCreateForm)
+from django_ledger.io.io_core import get_localdate
 from django_ledger.models import EntityModel, LedgerModel, EstimateModel
 from django_ledger.models.invoice import InvoiceModel
 from django_ledger.views.mixins import DjangoLedgerSecurityMixIn
@@ -111,7 +111,7 @@ class InvoiceModelCreateView(DjangoLedgerSecurityMixIn, InvoiceModelModelViewQue
 
     def get_initial(self):
         return {
-            'date_draft': localdate()
+            'date_draft': get_localdate()
         }
 
     def get_form(self, form_class=None):
@@ -131,8 +131,8 @@ class InvoiceModelCreateView(DjangoLedgerSecurityMixIn, InvoiceModelModelViewQue
     def form_valid(self, form):
         invoice_model: InvoiceModel = form.save(commit=False)
         ledger_model, invoice_model = invoice_model.configure(
-            entity_slug=self.kwargs['entity_slug'],
-            user_model=self.request.user,
+            entity_slug=self.AUTHORIZED_ENTITY_MODEL,
+            commit_ledger=True
         )
 
         if self.for_estimate:
@@ -391,7 +391,10 @@ class InvoiceModelDetailView(DjangoLedgerSecurityMixIn, InvoiceModelModelViewQue
             'customer',
             'cash_account',
             'prepaid_account',
-            'unearned_account'
+            'unearned_account',
+            'cash_account__coa_model',
+            'prepaid_account__coa_model',
+            'unearned_account__coa_model'
         )
 
 

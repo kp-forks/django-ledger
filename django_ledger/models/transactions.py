@@ -2,18 +2,16 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
+The TransactionModel is the lowest accounting level where financial information is recorded. Every transaction with a
+financial implication must be part of a JournalEntryModel, which encapsulates a collection of TransactionModels.
+Transaction models cannot exist without being part of a validated JournalEntryModel. Orphan TransactionModels are not
+allowed, and this is enforced by the database.
 
-The TransactionModel is the lowest accounting level where the financial information is recorded on the books.
-Every transaction which has an financial implication must be recorded as part of a JournalEntryModel, which in turn
-encapsulates a collection of TransactionModels. Transaction models cannot exist without being part of a validated
-JournalEntryModel. Orphan TransactionModels are not allowed, and this is enforced by the database.
-
-A transaction by definition must perform a CREDIT or a DEBIT to the underlying AccountModel. The IOMixIn plays a crucial
-role in the production of financial statements and sets its foundation in the TransactionModel API to effective query
-amd aggregate transactions at the Database layer without the need of pulling all TransactionModels into memory for the
-production of financial statements.
+A transaction must perform a CREDIT or a DEBIT to the underlying AccountModel. The IOMixIn is crucial for the
+production of financial statements and sets its foundation in the TransactionModel API. It allows for effective
+querying and aggregating transactions at the Database layer without pulling all TransactionModels into memory.
+This approach streamlines the production of financial statements. The IOMixIn in the TransactionModel API is essential
+for efficient and effective financial statement generation.
 """
 from datetime import datetime, date
 from typing import List, Union, Optional
@@ -23,10 +21,11 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import models
-from django.db.models import Q, QuerySet
+from django.db.models import Q, QuerySet, Manager, F
+from django.db.models.signals import pre_save
 from django.utils.translation import gettext_lazy as _
 
-from django_ledger.io import validate_io_date
+from django_ledger.io.io_core import validate_io_timestamp
 from django_ledger.models.accounts import AccountModel
 from django_ledger.models.bill import BillModel
 from django_ledger.models.entity import EntityModel
@@ -45,7 +44,8 @@ class TransactionModelValidationError(ValidationError):
 
 class TransactionModelQuerySet(QuerySet):
     """
-    A custom defined EntityUnitModel Queryset.
+    A custom QuerySet class for TransactionModels implementing methods to effectively and safely read
+    TransactionModels from the database.
     """
 
     def posted(self) -> QuerySet:
@@ -79,7 +79,7 @@ class TransactionModelQuerySet(QuerySet):
         TransactionModelQuerySet
             Returns a TransactionModelQuerySet with applied filters.
         """
-        if len(account_list) > 0 and isinstance(account_list[0], str):
+        if isinstance(account_list, list) > 0 and isinstance(account_list[0], str):
             return self.filter(account__code__in=account_list)
         return self.filter(account__in=account_list)
 
@@ -156,7 +156,7 @@ class TransactionModelQuerySet(QuerySet):
         """
 
         if isinstance(to_date, str):
-            to_date = validate_io_date(to_date)
+            to_date = validate_io_timestamp(to_date)
 
         if isinstance(to_date, date):
             return self.filter(journal_entry__timestamp__date__lte=to_date)
@@ -180,7 +180,7 @@ class TransactionModelQuerySet(QuerySet):
             Returns a TransactionModelQuerySet with applied filters.
         """
         if isinstance(from_date, str):
-            from_date = validate_io_date(from_date)
+            from_date = validate_io_timestamp(from_date)
 
         if isinstance(from_date, date):
             return self.filter(journal_entry__timestamp__date__gte=from_date)
@@ -188,36 +188,62 @@ class TransactionModelQuerySet(QuerySet):
         return self.filter(journal_entry__timestamp__gte=from_date)
 
     def not_closing_entry(self):
+        """
+        Filter the Transactions based on whether they are closing entries or not.
+
+        Returns:
+            QuerySet: A filtered QuerySet of entries where the journal_entry__is_closing_entry field is False.
+        """
         return self.filter(journal_entry__is_closing_entry=False)
 
     def is_closing_entry(self):
+        """
+        Filter the Transactions based on whether they are closing entries or not.
+
+        Returns:
+            QuerySet: A filtered QuerySet of entries where the journal_entry__is_closing_entry field is True.
+        """
         return self.filter(journal_entry__is_closing_entry=True)
 
 
-class TransactionModelAdmin(models.Manager):
+class TransactionModelManager(Manager):
+    """
+    A manager class for the TransactionModel.
+    """
+
+    def get_queryset(self) -> TransactionModelQuerySet:
+        qs = TransactionModelQuerySet(self.model, using=self._db)
+        return qs.annotate(
+            _coa_id=F('account__coa_model_id'),
+        ).select_related(
+            'journal_entry',
+            'account',
+            'account__coa_model',
+        )
 
     def for_user(self, user_model) -> TransactionModelQuerySet:
         """
-        Fetches a QuerySet of TransactionModels that the UserModel as access to. For convenience, the AccountModel
-        information is selected, since much of the operations associated with transactions will involve information
-        from the AccountModel. For example, the AccountModel balance type plays a crucial role in the production of
-        financial statements.
-
-        May include TransactionModels from multiple Entities.
-
-        The user has access to transactions if:
-            1. Is listed as Manager of Entity.
-            2. Is the Admin of the Entity.
-
         Parameters
         ----------
-        user_model
-            Logged in and authenticated django UserModel instance.
+        user_model : User model object
+            The user model object representing the user for whom to filter the transactions.
 
         Returns
         -------
         TransactionModelQuerySet
-            Returns a TransactionModelQuerySet with applied filters.
+            A queryset of transaction models filtered based on the user's permissions.
+
+        Raises
+        ------
+        None
+
+        Description
+        -----------
+        This method filters the transactions based on the user's permissions.
+        If the user is a superuser, all transactions are returned. Otherwise, the transactions are filtered based on
+        the user's relationship to the entities associated with the transactions. Specifically, the transactions are
+        filtered to include only those where either the user is an admin of the entity associated with the transaction's
+        ledger or the user is one of the managers of the entity associated with the transaction's ledger.
         """
         qs = self.get_queryset()
         return qs.filter(
@@ -230,22 +256,20 @@ class TransactionModelAdmin(models.Manager):
                    user_model: Optional[UserModel] = None,
                    ) -> TransactionModelQuerySet:
         """
-        Fetches a QuerySet of TransactionModels associated with the specified
-        EntityModel. For security if UserModel is provided, will make sure the user_model provided is either the admin
-        or the manager of the entity.
-
         Parameters
         ----------
-        entity_slug: str or EntityModel
-            The entity slug or EntityModel used for filtering the QuerySet.
-        user_model: Optional Django UserModel
-            Optional logged in and authenticated Django UserModel instance to match against Entity Admin or Managers.
-            Will make sure the authenticated user has access to the EntityModel transactions.
+        entity_slug : Union[EntityModel, str, UUID]
+            The entity slug or ID for which to retrieve transactions.
+            Can be an instance of EntityModel, a string representing the slug, or a UUID.
+        user_model : Optional[UserModel], optional
+            The user model for which to filter transactions.
+            If provided, only transactions associated with the specified user will be returned.
+            Defaults to None.
 
         Returns
         -------
         TransactionModelQuerySet
-            Returns a TransactionModelQuerySet with applied filters.
+            A QuerySet of TransactionModel instances filtered by the provided parameters.
         """
 
         if user_model:
@@ -264,50 +288,50 @@ class TransactionModelAdmin(models.Manager):
                    ledger_model: Union[LedgerModel, UUID],
                    user_model: Optional[UserModel] = None):
         """
-        Fetches a QuerySet of TransactionModels that the UserModel as access to and are associated with a specific
-        LedgerModel instance.
-
         Parameters
         ----------
-        user_model
-            Optional logged in and authenticated django UserModel instance to validate against managers and admin.
-        entity_slug: str or EntityModel
-            The entity slug or EntityModel used for filtering the QuerySet.
-        ledger_model: LedgerModel or UUID
-            The LedgerModel or LedgerModel UUID associated with the TransactionModel to be queried.
+        entity_slug : Union[EntityModel, str]
+            The slug or instance of the entity for which to filter the ledger.
+        ledger_model : Union[LedgerModel, UUID]
+            The ledger model or UUID of the ledger for which to filter the journal entries.
+        user_model : Optional[UserModel], optional
+            The user model associated with the entity. Default is None.
 
         Returns
         -------
-        TransactionModelQuerySet
-            Returns a TransactionModelQuerySet with applied filters.
+        QuerySet
+            The filtered QuerySet containing the journal entries for the specified entity and ledger.
         """
         qs = self.for_entity(user_model=user_model, entity_slug=entity_slug)
-        if isinstance(ledger_model, LedgerModel):
-            return qs.filter(journal_entry__ledger=ledger_model)
-        elif isinstance(ledger_model, str) or isinstance(ledger_model, UUID):
+        if isinstance(ledger_model, UUID):
             return qs.filter(journal_entry__ledger__uuid__exact=ledger_model)
+        return qs.filter(journal_entry__ledger=ledger_model)
 
     def for_unit(self,
                  entity_slug: Union[EntityModel, str],
                  unit_slug: str = Union[EntityUnitModel, str],
                  user_model: Optional[UserModel] = None):
         """
-        Fetches a QuerySet of TransactionModels that the UserModel as access to and are associated with a specific
-        EntityUnitModel instance.
+        Returns the queryset filtered for the specified entity unit.
 
         Parameters
         ----------
-        user_model
-            Optional logged in and authenticated django UserModel instance to validate against managers and admin.
-        entity_slug: str or EntityModel
-            The entity slug or EntityModel used for filtering the QuerySet.
-        unit_slug: EntityUnitModel or EntityUnitModel UUID.
-            The EntityUnitModel or EntityUnitModel UUID associated with the TransactionModel to be queried.
+        entity_slug : Union[EntityModel, str]
+            The entity model or slug used to filter the queryset.
+        unit_slug : Union[EntityUnitModel, str]
+            The entity unit model or slug used to filter the queryset.
+        user_model : Optional[UserModel], optional
+            The user model to consider for filtering the queryset, by default None.
 
         Returns
         -------
-        TransactionModelQuerySet
-            Returns a TransactionModelQuerySet with applied filters.
+        QuerySet
+            The filtered queryset based on the specified entity unit.
+
+        Notes
+        -----
+        - If `unit_slug` is an instance of `EntityUnitModel`, the queryset is filtered using `journal_entry__entity_unit=unit_slug`.
+        - If `unit_slug` is a string, the queryset is filtered using `journal_entry__entity_unit__slug__exact=unit_slug`.
         """
         qs = self.for_entity(user_model=user_model, entity_slug=entity_slug)
         if isinstance(unit_slug, EntityUnitModel):
@@ -320,24 +344,23 @@ class TransactionModelAdmin(models.Manager):
                           je_model,
                           user_model: Optional[UserModel] = None):
         """
-        Fetches a QuerySet of TransactionModels that the UserModel as access to and are associated with a specific
-        LedgerModel AND JournalEntryModel instance.
-
         Parameters
         ----------
-        user_model: UserModel
-            Optional logged in and authenticated django UserModel instance to validate against managers and admin.
-        entity_slug: str or EntityModel
-            The entity slug or EntityModel used for filtering the QuerySet.
-        ledger_model: LedgerModel or str or UUID
-            The LedgerModel or LedgerModel UUID associated with the TransactionModel to be queried.
-        je_model: JournalEntryModel or str or UUID
-            The JournalEntryModel or JournalEntryModel UUID associated with the TransactionModel to be queried.
+        entity_slug : Union[EntityModel, str]
+            The entity slug or instance of EntityModel representing the entity for which the journal entry is requested.
+        ledger_model : Union[LedgerModel, str, UUID]
+            The ledger model or its identifier (str or UUID) representing the ledger for which the journal entry
+            is requested.
+        je_model : Type[JournalEntryModel]
+            The journal entry model or its identifier (str or UUID) representing the journal entry to filter by.
+        user_model : Optional[UserModel], default=None
+            An optional user model instance representing the user for whom the journal entry is requested.
 
         Returns
         -------
-        TransactionModelQuerySet
-            Returns a TransactionModelQuerySet with applied filters.
+        QuerySet
+            The filtered queryset of journal entries.
+
         """
         qs = self.for_ledger(user_model=user_model,
                              entity_slug=entity_slug,
@@ -352,22 +375,20 @@ class TransactionModelAdmin(models.Manager):
                  entity_slug: str,
                  bill_model: Union[BillModel, str, UUID]):
         """
-        Fetches a QuerySet of TransactionModels that the UserModel as access to and are associated with a specific
-        BillModel instance.
-
         Parameters
         ----------
-        user_model
-            Logged in and authenticated django UserModel instance.
-        entity_slug: str or EntityModel
-            The entity slug or EntityModel used for filtering the QuerySet.
-        bill_model: BillModel or str or UUID
-            The BillModel or BillModel UUID associated with the TransactionModel to be queried.
+        user_model : Type
+            An instance of user model.
+        entity_slug : str
+            The slug of the entity.
+        bill_model : Union[BillModel, str, UUID]
+            An instance of bill model or a string/UUID representing the UUID of the bill model.
 
         Returns
         -------
-        TransactionModelQuerySet
-            Returns a TransactionModelQuerySet with applied filters.
+        FilterQuerySet
+            A filtered queryset based on the user model, entity slug, and bill model.
+
         """
         qs = self.for_entity(
             user_model=user_model,
@@ -381,22 +402,19 @@ class TransactionModelAdmin(models.Manager):
                     entity_slug: str,
                     invoice_model: Union[InvoiceModel, str, UUID]):
         """
-        Fetches a QuerySet of TransactionModels that the UserModel as access to and are associated with a specific
-        InvoiceModel instance.
-
         Parameters
         ----------
-        user_model
-            Logged in and authenticated django UserModel instance.
-        entity_slug: str or EntityModel
-            The entity slug or EntityModel used for filtering the QuerySet.
-        invoice_model: InvoiceModel or str or UUID
-            The InvoiceModel or InvoiceModel UUID associated with the TransactionModel to be queried.
+        user_model : [type]
+            The user model used for filtering entities.
+        entity_slug : str
+            The slug of the entity used for filtering.
+        invoice_model : Union[InvoiceModel, str, UUID]
+            The invoice model or its identifier used for filtering.
 
         Returns
         -------
-        TransactionModelQuerySet
-            Returns a TransactionModelQuerySet with applied filters.
+        QuerySet
+            The filtered queryset based on the specified parameters.
         """
         qs = self.for_entity(
             user_model=user_model,
@@ -408,27 +426,46 @@ class TransactionModelAdmin(models.Manager):
 
 class TransactionModelAbstract(CreateUpdateMixIn):
     """
-    This is the main abstract class which the BillModel database will inherit from.
-    The BillModel inherits functionality from the following MixIns:
 
-        1. :func:`CreateUpdateMixIn <django_ledger.models.mixins.CreateUpdateMixIn>`
+    TransactionModelAbstract
+
+    An abstract class that represents a transaction in the ledger system.
 
     Attributes
     ----------
-    uuid : UUID
-        This is a unique primary key generated for the table. The default value of this field is uuid4().
-    tx_type: str
-        Transaction type as a String, representing a CREDIT or a DEBIT to the AccountModel associated with the
-        TransactionModel instance.
-    journal_entry: JournalEntryModel
-        The JournalEntryModel associated with the TransactionModel instance.
-    account: AccountModel
-        The AccountModel associated with the TransactionModel instance.
-    amount: Decimal
-        The monetary amount of the transaction instance, represented by the python Decimal field.
-        Must be greater than zero.
-    description: str
-        A TransactionModel description. Maximum length is 100.
+
+    - CREDIT: A constant representing a credit transaction.
+    - DEBIT: A constant representing a debit transaction.
+
+    - TX_TYPE: A list of tuples representing the transaction type choices.
+
+    - uuid: A UUIDField representing the unique identifier of the transaction.
+        This field is automatically generated and is not editable.
+
+    - tx_type: A CharField representing the type of the transaction.
+        It has a maximum length of 10 characters and accepts choices from the TX_TYPE list.
+
+    - journal_entry: A ForeignKey representing the journal entry associated with the transaction.
+        It references the 'django_ledger.JournalEntryModel' model.
+
+    - account: A ForeignKey representing the account associated with the transaction.
+        It references the 'django_ledger.AccountModel' model.
+
+    - amount: A DecimalField representing the amount of the transaction.
+        It has a maximum of 2 decimal places and a maximum of 20 digits.
+        It defaults to 0.00 and accepts a minimum value of 0.
+
+    - description: A CharField representing the description of the transaction.
+        It has a maximum length of 100 characters and is optional.
+
+    - objects: An instance of the TransactionModelAdmin class.
+
+    Methods
+    -------
+
+    - clean(): Performs validation on the transaction instance.
+        Raises a TransactionModelValidationError if the account is a root account.
+
     """
 
     CREDIT = 'credit'
@@ -461,7 +498,11 @@ class TransactionModelAbstract(CreateUpdateMixIn):
                                    blank=True,
                                    verbose_name=_('Tx Description'),
                                    help_text=_('A description to be included with this individual transaction'))
-    objects = TransactionModelAdmin.from_queryset(queryset_class=TransactionModelQuerySet)()
+
+    cleared = models.BooleanField(default=False, verbose_name=_('Cleared'))
+    reconciled = models.BooleanField(default=False, verbose_name=_('Reconciled'))
+
+    objects = TransactionModelManager()
 
     class Meta:
         abstract = True
@@ -473,19 +514,29 @@ class TransactionModelAbstract(CreateUpdateMixIn):
             models.Index(fields=['account']),
             models.Index(fields=['journal_entry']),
             models.Index(fields=['created']),
-            models.Index(fields=['updated'])
+            models.Index(fields=['updated']),
+            models.Index(fields=['cleared']),
+            models.Index(fields=['reconciled']),
         ]
 
     def __str__(self):
-        # pylint: disable=no-member
         return '{x1}-{x2}/{x5}: {x3}/{x4}'.format(x1=self.account.code,
                                                   x2=self.account.name,
                                                   x3=self.amount,
                                                   x4=self.tx_type,
                                                   x5=self.account.balance_type)
 
+    @property
+    def coa_id(self):
+        try:
+            return getattr(self, '_coa_id')
+        except AttributeError:
+            if self.account is None:
+                return None
+            return self.account.coa_model_id
+
     def clean(self):
-        if self.account.is_root_account():
+        if self.account_id and self.account.is_root_account():
             raise TransactionModelValidationError(
                 message=_('Cannot transact on root accounts')
             )
@@ -495,3 +546,47 @@ class TransactionModel(TransactionModelAbstract):
     """
     Base Transaction Model From Abstract.
     """
+
+    class Meta(TransactionModelAbstract.Meta):
+        abstract = False
+        swappable = 'DJANGO_LEDGER_TRANSACTION_MODEL'
+
+
+def transactionmodel_presave(instance: TransactionModel, **kwargs):
+    """
+    Parameters
+    ----------
+    instance : TransactionModel
+        The transaction model instance that is being saved.
+    kwargs : dict
+        Additional keyword arguments.
+
+    Notes
+    -----
+    This method is called before saving a transaction model instance.
+    It performs some checks before allowing the save operation.
+
+    Raises
+    ------
+    TransactionModelValidationError
+        If one of the following conditions is met:
+        - `bypass_account_state` is False and the `can_transact` method of the associated account model returns False.
+        - The journal entry associated with the transaction is locked.
+
+    """
+    bypass_account_state = kwargs.get('bypass_account_state', False)
+    if all([
+        not bypass_account_state,
+        not instance.account.can_transact()
+    ]):
+        raise TransactionModelValidationError(
+            message=_(f'Cannot create or modify transactions on account model {instance.account}.')
+        )
+
+    if instance.journal_entry.is_locked():
+        raise TransactionModelValidationError(
+            message=_('Cannot modify transactions on locked journal entries.')
+        )
+
+
+pre_save.connect(transactionmodel_presave, sender=TransactionModel)

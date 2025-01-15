@@ -2,9 +2,6 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
-
 An EntityUnit is a logical, user-defined grouping which is assigned to JournalEntryModels to help segregate business
 operations into separate components. Examples of business units may include Departments (i.e. Human Resources, IT, etc.)
 office locations, a real estate property, or any other label relevant to the business.
@@ -34,7 +31,7 @@ from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 from treebeard.mp_tree import MP_Node, MP_NodeManager, MP_NodeQuerySet
 
-from django_ledger.io.io_mixin import IOMixIn
+from django_ledger.io.io_core import IOMixIn
 from django_ledger.models import lazy_loader
 from django_ledger.models.mixins import CreateUpdateMixIn, SlugNameMixIn
 
@@ -52,6 +49,15 @@ class EntityUnitModelQuerySet(MP_NodeQuerySet):
 
 
 class EntityUnitModelManager(MP_NodeManager):
+
+    def for_user(self, user_model):
+        qs = self.get_queryset()
+        if user_model.is_superuser:
+            return qs
+        return qs.filter(
+            Q(entity__admin=user_model) |
+            Q(entity__managers__in=[user_model])
+        )
 
     def for_entity(self, entity_slug: str, user_model):
         """
@@ -76,23 +82,14 @@ class EntityUnitModelManager(MP_NodeManager):
         EntityUnitModelQuerySet
             Returns a EntityUnitModelQuerySet with applied filters.
         """
-        qs = self.get_queryset()
+        qs = self.for_user(user_model)
         if isinstance(entity_slug, lazy_loader.get_entity_model()):
             return qs.filter(
-                Q(entity=entity_slug) &
-                (
-                        Q(entity__admin=user_model) |
-                        Q(entity__managers__in=[user_model])
-                )
+                Q(entity=entity_slug)
 
             )
         return qs.filter(
-            Q(entity__slug__exact=entity_slug) &
-            (
-                    Q(entity__admin=user_model) |
-                    Q(entity__managers__in=[user_model])
-            )
-
+            Q(entity__slug__exact=entity_slug)
         )
 
 
@@ -212,8 +209,21 @@ class EntityUnitModelAbstract(MP_Node,
             self.slug = unit_slug
         return self.slug
 
+    def get_absolute_url(self):
+        return reverse(
+            viewname='django_ledger:unit-detail',
+            kwargs={
+                'entity_slug': self.entity.slug,
+                'unit_slug': self.slug
+            }
+        )
+
 
 class EntityUnitModel(EntityUnitModelAbstract):
     """
     Base Model Class for EntityUnitModel
     """
+
+    class Meta(EntityUnitModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_ENTITY_UNIT_MODEL'
+        abstract = False

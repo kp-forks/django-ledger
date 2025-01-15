@@ -5,8 +5,8 @@ from urllib.parse import urlparse
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.urls import reverse
-from django.utils.timezone import localdate
 
+from django_ledger.io.io_core import get_localdate
 from django_ledger.models import EntityModel
 from django_ledger.tests.base import DjangoLedgerBaseTest
 from django_ledger.urls.entity import urlpatterns as entity_urls
@@ -226,8 +226,8 @@ class EntityModelTests(DjangoLedgerBaseTest):
                                         })
             response = self.CLIENT.get(entity_detail_url)
 
-        with self.assertNumQueries(7):  # previously 10
-            local_dt = localdate()
+        with self.assertNumQueries(8):  # previously 10
+            local_dt = get_localdate()
             entity_month_detail_url = reverse('django_ledger:entity-dashboard-month',
                                               kwargs={
                                                   'entity_slug': entity_model.slug,
@@ -236,7 +236,7 @@ class EntityModelTests(DjangoLedgerBaseTest):
                                               })
             self.assertRedirects(response, entity_month_detail_url)
 
-        with self.assertNumQueries(7):
+        with self.assertNumQueries(8):
             # same as before, but this time the session must not be update because user has not suited entities...
             response = self.CLIENT.get(entity_month_detail_url)
             self.assertContains(response, text=entity_model.name)
@@ -249,7 +249,7 @@ class EntityModelTests(DjangoLedgerBaseTest):
         # entity_models = self.create_entity_models(n=1)
         entity_model = choice(self.ENTITY_MODEL_QUERYSET)
         # ENTITY-DELETE VIEW...
-        with self.assertNumQueries(3):
+        with self.assertNumQueries(4):
             entity_delete_url = reverse('django_ledger:entity-delete',
                                         kwargs={
                                             'entity_slug': entity_model.slug

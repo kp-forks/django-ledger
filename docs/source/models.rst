@@ -31,7 +31,7 @@ Ledger Model
 
 Transaction Model
 -----------------
-.. automodule:: django_ledger.models.transaction
+.. automodule:: django_ledger.models.transactions
     :members:
 
 Journal Entry Model
@@ -92,5 +92,10 @@ Vendor Model
 MixIns
 ------
 .. automodule:: django_ledger.models.mixins
+    :members:
+
+Signals
+-------
+.. automodule:: django_ledger.models.signals
     :members:
 

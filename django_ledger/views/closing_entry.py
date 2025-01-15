@@ -1,16 +1,24 @@
+"""
+Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
+Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
+
+Contributions to this module:
+    * Miguel Sanda <msanda@arrobalytics.com>
+"""
+
 from django.contrib import messages
 from django.core.exceptions import ValidationError, ImproperlyConfigured
 from django.db.models import Count
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
-from django.utils.timezone import localdate
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import ArchiveIndexView, YearArchiveView, MonthArchiveView, DetailView, \
-    RedirectView, FormView, CreateView, DeleteView, UpdateView
+    RedirectView, CreateView, DeleteView, UpdateView
 from django.views.generic.detail import SingleObjectMixin
 
 from django_ledger.forms.closing_entry import ClosingEntryCreateForm, ClosingEntryUpdateForm
+from django_ledger.io.io_core import get_localdate
 from django_ledger.models.closing_entry import ClosingEntryModel
 from django_ledger.models.entity import EntityModel
 from django_ledger.views import DjangoLedgerSecurityMixIn
@@ -74,7 +82,7 @@ class ClosingEntryModelCreateView(DjangoLedgerSecurityMixIn, ClosingEntryModelVi
 
     def get_initial(self):
         return {
-            'closing_date': localdate()
+            'closing_date': get_localdate()
         }
 
     def get_object(self, queryset=None):

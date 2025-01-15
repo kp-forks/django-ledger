@@ -2,9 +2,6 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
-
 This module implements the different model MixIns used on different Django Ledger Models to implement common
 functionality.
 """
@@ -13,7 +10,7 @@ from collections import defaultdict
 from datetime import timedelta, date, datetime
 from decimal import Decimal
 from itertools import groupby
-from typing import Optional, Union, Dict, List
+from typing import Optional, Union, Dict
 from uuid import UUID
 
 from django.conf import settings
@@ -23,12 +20,10 @@ from django.core.validators import int_list_validator
 from django.db import models
 from django.db.models import QuerySet
 from django.utils.encoding import force_str
-from django.utils.timezone import localdate, localtime
 from django.utils.translation import gettext_lazy as _
 from markdown import markdown
 
-from django_ledger.io import (check_tx_balance, ASSET_CA_CASH, ASSET_CA_PREPAID, LIABILITY_CL_DEFERRED_REVENUE,
-                              validate_io_date)
+from django_ledger.io.io_core import validate_io_timestamp, check_tx_balance, get_localtime, get_localdate
 from django_ledger.models.utils import lazy_loader
 
 logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
@@ -489,7 +484,8 @@ class AccrualMixIn(models.Model):
         if ledger_model.locked:
             if raise_exception:
                 raise ValidationError(f'Bill ledger {ledger_model.name} is already locked...')
-        ledger_model.lock(commit)
+            return
+        ledger_model.lock(commit, raise_exception=raise_exception)
 
     def unlock_ledger(self, commit: bool = False, raise_exception: bool = True, **kwargs):
         """
@@ -503,10 +499,11 @@ class AccrualMixIn(models.Model):
             If True, raises ValidationError if LedgerModel already locked.
         """
         ledger_model = self.ledger
-        if not ledger_model.locked:
+        if not ledger_model.is_locked():
             if raise_exception:
                 raise ValidationError(f'Bill ledger {ledger_model.name} is already unlocked...')
-        ledger_model.unlock(commit)
+            return
+        ledger_model.unlock(commit, raise_exception=raise_exception)
 
     # POST/UNPOST Ledger...
     def post_ledger(self, commit: bool = False, raise_exception: bool = True, **kwargs):
@@ -524,7 +521,8 @@ class AccrualMixIn(models.Model):
         if ledger_model.posted:
             if raise_exception:
                 raise ValidationError(f'Bill ledger {ledger_model.name} is already posted...')
-        ledger_model.post(commit)
+            return
+        ledger_model.post(commit, raise_exception=raise_exception)
 
     def unpost_ledger(self, commit: bool = False, raise_exception: bool = True, **kwargs):
         """
@@ -538,13 +536,14 @@ class AccrualMixIn(models.Model):
             If True, raises ValidationError if LedgerModel already locked.
         """
         ledger_model = self.ledger
-        if not ledger_model.posted:
+        if not ledger_model.is_posted():
             if raise_exception:
                 raise ValidationError(f'Bill ledger {ledger_model.name} is not posted...')
-        ledger_model.post(commit)
+            return
+        ledger_model.post(commit, raise_exception=raise_exception)
 
     def migrate_state(self,
-                      # todo: remove usermodel param...
+                      # todo: remove usermodel param...?
                       user_model,
                       entity_slug: str,
                       itemtxs_qs: Optional[QuerySet] = None,
@@ -745,14 +744,14 @@ class AccrualMixIn(models.Model):
 
             if commit:
                 JournalEntryModel = lazy_loader.get_journal_entry_model()
-                TransactionModel = lazy_loader.get_transaction_model()
+                TransactionModel = lazy_loader.get_txs_model()
 
                 unit_uuids = list(set(k[1] for k in idx_keys))
 
                 if je_timestamp:
-                    je_timestamp = validate_io_date(dt=je_timestamp)
+                    je_timestamp = validate_io_timestamp(dt=je_timestamp)
 
-                now_timestamp = localtime() if not je_timestamp else je_timestamp
+                now_timestamp = get_localtime() if not je_timestamp else je_timestamp
                 je_list = {
                     u: JournalEntryModel(
                         entity_unit_id=u,
@@ -899,11 +898,11 @@ class AccrualMixIn(models.Model):
             ]):
                 raise ValidationError('Must provide all accounts Cash, Prepaid, UnEarned.')
 
-        if self.accrue:
-            if self.is_approved():
-                self.progress = Decimal.from_float(1.00)
-            else:
-                self.progress = Decimal.from_float(0.00)
+        # if self.accrue:
+        #     if self.is_approved():
+        #         self.progress = Decimal.from_float(1.00)
+        #     else:
+        #         self.progress = Decimal.from_float(0.00)
 
         if self.amount_paid > self.amount_due:
             raise ValidationError(f'Amount paid {self.amount_paid} cannot exceed amount due {self.amount_due}')
@@ -911,7 +910,7 @@ class AccrualMixIn(models.Model):
         if self.is_paid():
             self.progress = Decimal.from_float(1.0)
             self.amount_paid = self.amount_due
-            today = localdate()
+            today = get_localdate()
 
             if not self.date_paid:
                 self.date_paid = today
@@ -1036,7 +1035,7 @@ class PaymentTermsMixIn(models.Model):
             Days as integer.
         """
         if self.date_due:
-            td = self.date_due - localdate()
+            td = self.date_due - get_localdate()
             if td.days < 0:
                 return 0
             return td.days

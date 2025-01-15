@@ -2,10 +2,6 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
-    * Pranav P Tulshyan <ptulshyan77@gmail.com>
-
 This module implements the BillModel, which represents an Invoice received from a Supplier/Vendor, on which
 the Vendor states the amount owed by the recipient for the purposes of supplying goods and/or services.
 In addition to tracking the bill amount, it tracks the paid and due amount.
@@ -27,18 +23,26 @@ from uuid import uuid4
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from django.db import models, transaction, IntegrityError
-from django.db.models import Q, Sum, F, Count
+from django.db.models import Q, Sum, F, Count, QuerySet, Manager
 from django.db.models.signals import pre_save
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
-from django.utils.timezone import localdate, localtime
 from django.utils.translation import gettext_lazy as _
 
 from django_ledger.io import ASSET_CA_CASH, ASSET_CA_PREPAID, LIABILITY_CL_ACC_PAYABLE
+from django_ledger.io.io_core import get_localtime, get_localdate
 from django_ledger.models.entity import EntityModel
 from django_ledger.models.items import ItemTransactionModelQuerySet, ItemTransactionModel, ItemModel, ItemModelQuerySet
 from django_ledger.models.mixins import (CreateUpdateMixIn, AccrualMixIn, MarkdownNotesMixIn,
                                          PaymentTermsMixIn, ItemizeMixIn)
+from django_ledger.models.signals import (
+    bill_status_draft,
+    bill_status_in_review,
+    bill_status_approved,
+    bill_status_paid,
+    bill_status_canceled,
+    bill_status_void,
+)
 from django_ledger.models.utils import lazy_loader
 from django_ledger.settings import (DJANGO_LEDGER_DOCUMENT_NUMBER_PADDING, DJANGO_LEDGER_BILL_NUMBER_PREFIX)
 
@@ -49,7 +53,7 @@ class BillModelValidationError(ValidationError):
     pass
 
 
-class BillModelQuerySet(models.QuerySet):
+class BillModelQuerySet(QuerySet):
     """
     A custom defined QuerySet for the BillModel. This implements multiple methods or queries needed to get a filtered
     QuerySet based on the BillModel status. For example, we might want to have list of bills which are paid, unpaid,
@@ -151,7 +155,7 @@ class BillModelQuerySet(models.QuerySet):
         BillModelQuerySet
             Returns a QuerySet of overdue bills only.
         """
-        return self.filter(date_due__lt=localdate())
+        return self.filter(date_due__lt=get_localdate())
 
     def unpaid(self):
         """
@@ -166,7 +170,7 @@ class BillModelQuerySet(models.QuerySet):
         return self.filter(bill_status__exact=BillModel.BILL_STATUS_APPROVED)
 
 
-class BillModelManager(models.Manager):
+class BillModelManager(Manager):
     """
     A custom defined BillModelManager that will act as an interface to handling the initial DB queries
     to the BillModel. The default "get_queryset" has been overridden to refer the custom defined
@@ -205,6 +209,8 @@ class BillModelManager(models.Manager):
             Returns a BillModelQuerySet with applied filters.
         """
         qs = self.get_queryset()
+        if user_model.is_superuser:
+            return qs
         return qs.filter(
             Q(ledger__entity__admin=user_model) |
             Q(ledger__entity__managers__in=[user_model])
@@ -233,20 +239,14 @@ class BillModelManager(models.Manager):
         BillModelQuerySet
             Returns a BillModelQuerySet with applied filters.
         """
-        qs = self.get_queryset()
+        qs = self.for_user(user_model)
         if isinstance(entity_slug, EntityModel):
             return qs.filter(
-                Q(ledger__entity=entity_slug) & (
-                        Q(ledger__entity__admin=user_model) |
-                        Q(ledger__entity__managers__in=[user_model])
-                )
+                Q(ledger__entity=entity_slug)
             )
         elif isinstance(entity_slug, str):
             return qs.filter(
-                Q(ledger__entity__slug__exact=entity_slug) & (
-                        Q(ledger__entity__admin=user_model) |
-                        Q(ledger__entity__managers__in=[user_model])
-                )
+                Q(ledger__entity__slug__exact=entity_slug)
             )
 
 
@@ -474,7 +474,7 @@ class BillModelAbstract(
 
             if date_draft and isinstance(date_draft, datetime):
                 date_draft = date_draft.date()
-            self.date_draft = localdate() if not date_draft else date_draft
+            self.date_draft = get_localdate() if not date_draft else date_draft
 
             LedgerModel = lazy_loader.get_ledger_model()
             ledger_model: LedgerModel = LedgerModel(entity=entity_model, posted=ledger_posted)
@@ -485,14 +485,15 @@ class BillModelAbstract(
             ledger_model.clean_fields()
             self.ledger = ledger_model
 
-            if commit_ledger:
+            if commit_ledger or commit:
                 self.ledger.save()
 
             if self.can_generate_bill_number():
                 self.generate_bill_number(commit=commit)
+                ledger_model.ledger_xid = f'bill-{self.bill_number.lower()}-{str(ledger_model.entity_id)[-5:]}'
+                ledger_model.save(update_fields=['ledger_xid'])
 
             self.clean()
-            self.clean_fields()
 
             if commit:
                 self.save()
@@ -615,9 +616,8 @@ class BillModelAbstract(
             account_unit_total=Sum('total_amount')
         )
 
-    def update_amount_due(self,
-                          itemtxs_qs: Optional[Union[ItemTransactionModelQuerySet, List[ItemTransactionModel]]] = None
-                          ) -> ItemTransactionModelQuerySet:
+    def update_amount_due(self, itemtxs_qs: Optional[
+        Union[ItemTransactionModelQuerySet, List[ItemTransactionModel]]] = None) -> ItemTransactionModelQuerySet:
         """
         Updates the BillModel amount due.
 
@@ -727,7 +727,7 @@ class BillModelAbstract(
             True if BillModel is past due, else False.
         """
         if self.date_due and self.is_approved():
-            return self.date_due < localdate()
+            return self.date_due < get_localdate()
         return False
 
     # Permissions....
@@ -991,7 +991,7 @@ class BillModelAbstract(
         self.clean()
 
         if not payment_date:
-            payment_date = localtime()
+            payment_date = get_localtime()
 
         if commit:
             self.migrate_state(
@@ -1063,7 +1063,7 @@ class BillModelAbstract(
             elif isinstance(date_draft, date):
                 self.date_draft = date_draft
         else:
-            self.date_draft = localdate()
+            self.date_draft = get_localdate()
 
         self.clean()
         if commit:
@@ -1074,6 +1074,9 @@ class BillModelAbstract(
                     'updated'
                 ]
             )
+        bill_status_draft.send_robust(sender=self.__class__,
+                                      instance=self,
+                                      commited=commit, **kwargs)
 
     def get_mark_as_draft_html_id(self) -> str:
         """
@@ -1168,7 +1171,7 @@ class BillModelAbstract(
             elif isinstance(date_in_review, date):
                 self.date_in_review = date_in_review
         else:
-            self.date_in_review = localdate()
+            self.date_in_review = get_localdate()
 
         self.clean()
         if commit:
@@ -1179,6 +1182,9 @@ class BillModelAbstract(
                     'updated'
                 ]
             )
+        bill_status_in_review.send_robust(sender=self.__class__,
+                                          instance=self,
+                                          commited=commit, **kwargs)
 
     def get_mark_as_review_html_id(self) -> str:
         """
@@ -1269,7 +1275,7 @@ class BillModelAbstract(
             elif isinstance(date_approved, date):
                 self.date_approved = date_approved
         else:
-            self.date_approved = localdate()
+            self.date_approved = get_localdate()
 
         self.get_state(commit=True)
         self.clean()
@@ -1286,6 +1292,9 @@ class BillModelAbstract(
                     force_migrate=self.accrue
                 )
             self.ledger.post(commit=commit, raise_exception=raise_exception)
+        bill_status_approved.send_robust(sender=self.__class__,
+                                         instance=self,
+                                         commited=commit, **kwargs)
 
     def get_mark_as_approved_html_id(self) -> str:
         """
@@ -1371,12 +1380,12 @@ class BillModelAbstract(
             elif isinstance(date_paid, date):
                 self.date_paid = date_paid
         else:
-            self.date_paid = localdate()
+            self.date_paid = get_localdate()
 
         self.progress = Decimal.from_float(1.0)
         self.amount_paid = self.amount_due
 
-        if self.date_paid > localdate():
+        if self.date_paid > get_localdate():
             raise BillModelValidationError(f'Cannot pay {self.__class__.__name__} in the future.')
         if self.date_paid < self.date_approved:
             raise BillModelValidationError(
@@ -1409,6 +1418,9 @@ class BillModelAbstract(
                 force_migrate=True
             )
             self.lock_ledger(commit=True)
+        bill_status_paid.send_robust(sender=self.__class__,
+                                     instance=self,
+                                     commited=commit, **kwargs)
 
     def get_mark_as_paid_html_id(self) -> str:
         """
@@ -1490,7 +1502,7 @@ class BillModelAbstract(
             elif isinstance(date_void, date):
                 self.date_void = date_void
         else:
-            self.date_void = localdate()
+            self.date_void = get_localdate()
 
         self.bill_status = self.BILL_STATUS_VOID
         self.void_state(commit=True)
@@ -1510,6 +1522,9 @@ class BillModelAbstract(
                 force_migrate=True)
             self.save()
             self.lock_ledger(commit=False, raise_exception=False)
+        bill_status_void.send_robust(sender=self.__class__,
+                                     instance=self,
+                                     commited=commit, **kwargs)
 
     def get_mark_as_void_html_id(self) -> str:
         """
@@ -1572,11 +1587,14 @@ class BillModelAbstract(
         if not self.can_cancel():
             raise BillModelValidationError(f'Bill {self.bill_number} cannot be canceled. Must be draft or in review.')
 
-        self.date_canceled = localdate() if not date_canceled else date_canceled
+        self.date_canceled = get_localdate() if not date_canceled else date_canceled
         self.bill_status = self.BILL_STATUS_CANCELED
         self.clean()
         if commit:
             self.save()
+        bill_status_canceled.send_robust(sender=self.__class__,
+                                         instance=self,
+                                         commited=commit, **kwargs)
 
     def get_mark_as_canceled_html_id(self) -> str:
         """
@@ -1886,6 +1904,10 @@ class BillModel(BillModelAbstract):
     Base BillModel from Abstract.
     """
 
+    class Meta(BillModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_BILL_MODEL'
+        abstract = False
+
 
 def billmodel_presave(instance: BillModel, **kwargs):
     if instance.can_generate_bill_number():
@@ -1893,13 +1915,3 @@ def billmodel_presave(instance: BillModel, **kwargs):
 
 
 pre_save.connect(receiver=billmodel_presave, sender=BillModel)
-
-# def billmodel_predelete(instance: BillModel, **kwargs):
-#     ledger_model = instance.ledger
-#     ledger_model.unpost(commit=False)
-#     ledger_model.remove_wrapped_model_info()
-#     ledger_model.itemtransactonmodel_set.all().delete()
-#     instance.ledger.delete()
-#
-#
-# pre_delete.connect(receiver=billmodel_predelete, sender=BillModel)

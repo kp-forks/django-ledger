@@ -10,7 +10,7 @@ Michael Noel <noel.michael87@gmail.com>
 from django.forms import ModelForm, modelformset_factory, BaseModelFormSet, TextInput, Select, ValidationError
 from django.utils.translation import gettext_lazy as _
 
-from django_ledger.io import check_tx_balance
+from django_ledger.io.io_core import check_tx_balance
 from django_ledger.models.accounts import AccountModel
 from django_ledger.models.journal_entry import JournalEntryModel
 from django_ledger.models.transactions import TransactionModel
@@ -50,12 +50,11 @@ class TransactionModelFormSet(BaseModelFormSet):
         self.JE_MODEL: JournalEntryModel = je_model
         self.LEDGER_PK = ledger_pk
         self.ENTITY_SLUG = entity_slug
-        self.queryset = self.JE_MODEL.transactionmodel_set.all().order_by('account__code')
 
-        account_qs = AccountModel.objects.for_entity_available(
+        account_qs = AccountModel.objects.for_entity(
             user_model=self.USER_MODEL,
-            entity_slug=self.ENTITY_SLUG
-        ).order_by('code')
+            entity_model=self.ENTITY_SLUG
+        ).available().order_by('code')
 
         for form in self.forms:
             form.fields['account'].queryset = account_qs
@@ -63,6 +62,9 @@ class TransactionModelFormSet(BaseModelFormSet):
                 form.fields['account'].disabled = True
                 form.fields['tx_type'].disabled = True
                 form.fields['amount'].disabled = True
+
+    def get_queryset(self):
+        return self.JE_MODEL.transactionmodel_set.all().order_by('account__code')
 
     def clean(self):
         if any(self.errors):

@@ -3,14 +3,13 @@ Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
 Contributions to this module:
-Miguel Sanda <msanda@arrobalytics.com>
+    * Miguel Sanda <msanda@arrobalytics.com>
 """
 from django.contrib import messages
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db.models import Count
 from django.http import HttpResponseForbidden
 from django.urls import reverse
-from django.utils.timezone import localtime
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import (YearArchiveView, MonthArchiveView, DetailView, UpdateView, CreateView, RedirectView,
                                   ArchiveIndexView, DeleteView)
@@ -20,6 +19,7 @@ from django_ledger.forms.journal_entry import (JournalEntryModelUpdateForm,
                                                JournalEntryModelCannotEditForm,
                                                JournalEntryModelCreateForm)
 from django_ledger.forms.transactions import get_transactionmodel_formset_class
+from django_ledger.io.io_core import get_localtime
 from django_ledger.models.journal_entry import JournalEntryModel
 from django_ledger.models.ledger import LedgerModel
 from django_ledger.views.mixins import DjangoLedgerSecurityMixIn
@@ -79,7 +79,7 @@ class JournalEntryCreateView(DjangoLedgerSecurityMixIn, CreateView, SingleObject
 
     def get_initial(self):
         return {
-            'timestamp': localtime()
+            'timestamp': get_localtime()
         }
 
     def get_success_url(self):
@@ -130,7 +130,7 @@ class JournalEntryUpdateView(DjangoLedgerSecurityMixIn, JournalEntryModelModelVi
 
     def get_form(self, form_class=None):
         je_model: JournalEntryModel = self.object
-        if not je_model.can_edit_timestamp():
+        if not je_model.can_edit():
             return JournalEntryModelCannotEditForm(
                 entity_slug=self.kwargs['entity_slug'],
                 ledger_model=je_model.ledger,

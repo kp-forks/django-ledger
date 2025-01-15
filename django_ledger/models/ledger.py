@@ -2,9 +2,6 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
-
 The LedgerModel is the heart of Django Ledger. It is a self-contained unit of accounting that implements a
 double-entry accounting system capable of creating and managing transactions into the ledger and producing any financial
 statements. In essence, an EntityModel is made of a collection of LedgerModels that drive the whole bookkeeping process.
@@ -23,7 +20,7 @@ which is the class responsible for making accounting queries to the Database in 
 The digest() method executes all necessary aggregations and optimizations in order to push as much work to the Database
 layer as possible in order to minimize the amount of data being pulled for analysis into the Python memory.
 
-The Django Ledger core model follows the following structure: \n
+The Django Ledger core model follows the following structure:
 EntityModel -< LedgerModel -< JournalEntryModel -< TransactionModel
 """
 from datetime import date
@@ -38,9 +35,17 @@ from django.db.models import Q, Min, F, Count
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 
-from django_ledger.io import IOMixIn
+from django_ledger.io.io_core import IOMixIn
 from django_ledger.models import lazy_loader
 from django_ledger.models.mixins import CreateUpdateMixIn
+from django_ledger.models.signals import (
+    ledger_posted,
+    ledger_unposted,
+    ledger_locked,
+    ledger_unlocked,
+    ledger_hidden,
+    ledger_unhidden
+)
 
 LEDGER_ID_CHARS = ascii_lowercase + digits
 
@@ -54,9 +59,42 @@ class LedgerModelQuerySet(models.QuerySet):
     Custom defined LedgerModel QuerySet.
     """
 
+    def locked(self):
+        """
+        Filters the QuerySet to only locked LedgerModel.
+
+        Returns
+        -------
+        LedgerModelQuerySet
+            A QuerySet with applied filters.
+        """
+        return self.filter(locked=True)
+
+    def unlocked(self):
+        """
+        Filters the QuerySet to only un-locked LedgerModel.
+
+        Returns
+        -------
+        LedgerModelQuerySet
+            A QuerySet with applied filters.
+        """
+        return self.filter(locked=False)
+
     def posted(self):
         """
         Filters the QuerySet to only posted LedgerModel.
+
+        Returns
+        -------
+        LedgerModelQuerySet
+            A QuerySet with applied filters.
+        """
+        return self.filter(posted=True)
+
+    def unposted(self):
+        """
+        Filters the QuerySet to only un-posted LedgerModel.
 
         Returns
         -------
@@ -73,7 +111,8 @@ class LedgerModelQuerySet(models.QuerySet):
 
     def current(self):
         return self.filter(
-            earliest_timestamp__gt=F('entity__last_closing_date')
+            Q(earliest_timestamp__date__gt=F('entity__last_closing_date'))
+            | Q(earliest_timestamp__isnull=True)
         )
 
 
@@ -88,6 +127,15 @@ class LedgerModelManager(models.Manager):
             Count('journal_entries'),
             earliest_timestamp=Min('journal_entries__timestamp',
                                    filter=Q(journal_entries__posted=True)),
+        )
+
+    def for_user(self, user_model):
+        qs = self.get_queryset()
+        if user_model.is_superuser:
+            return qs
+        return qs.filter(
+            Q(entity__admin=user_model) |
+            Q(entity__managers__in=[user_model])
         )
 
     def for_entity(self, entity_slug, user_model):
@@ -107,21 +155,13 @@ class LedgerModelManager(models.Manager):
         LedgerModelQuerySet
             A Filtered LedgerModelQuerySet.
         """
-        qs = self.get_queryset()
+        qs = self.for_user(user_model)
         if isinstance(entity_slug, lazy_loader.get_entity_model()):
             return qs.filter(
-                Q(entity=entity_slug) &
-                (
-                        Q(entity__admin=user_model) |
-                        Q(entity__managers__in=[user_model])
-                )
+                Q(entity=entity_slug)
             )
         return qs.filter(
-            Q(entity__slug__exact=entity_slug) &
-            (
-                    Q(entity__admin=user_model) |
-                    Q(entity__managers__in=[user_model])
-            )
+            Q(entity__slug__exact=entity_slug)
         )
 
 
@@ -135,6 +175,8 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
         This is a unique primary key generated for the table. The default value of this field is uuid4().
     name: str
         Human-readable name of the LedgerModel. Maximum 150 characters.
+    ledger_xid: str
+        A unique user-defined identifier for the LedgerModel. Unique for the Entity Model.
     entity: EntityModel
         The EntityModel associated with the LedgerModel instance.
     posted: bool
@@ -146,11 +188,12 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
     """
     _WRAPPED_MODEL_KEY = 'wrapped_model'
     uuid = models.UUIDField(default=uuid4, editable=False, primary_key=True)
+    ledger_xid = models.SlugField(allow_unicode=True, max_length=150, null=True, blank=True,
+                                  verbose_name=_('Ledger External ID'),
+                                  help_text=_('User Defined Ledger ID'))
     name = models.CharField(max_length=150, null=True, blank=True, verbose_name=_('Ledger Name'))
 
-    # todo: rename to entity_model...
     entity = models.ForeignKey('django_ledger.EntityModel',
-                               editable=False,
                                on_delete=models.CASCADE,
                                verbose_name=_('Ledger Entity'))
     posted = models.BooleanField(default=False, verbose_name=_('Posted Ledger'))
@@ -172,10 +215,21 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
             models.Index(fields=['entity']),
             models.Index(fields=['entity', 'posted']),
             models.Index(fields=['entity', 'locked']),
+            models.Index(fields=['entity', 'ledger_xid']),
+            models.Index(fields=['ledger_xid']),
+        ]
+        unique_together = [
+            ('entity', 'ledger_xid')
         ]
 
     def __str__(self):
-        return self.name
+        if self.name is not None:
+            ledger_str = f'LedgerModel: {self.name}'
+        elif self.ledger_xid is not None:
+            ledger_str = f'LedgerModel: {self.ledger_xid}'
+        else:
+            ledger_str = f'LedgerModel: {self.uuid}'
+        return f'{ledger_str} | Posted: {self.posted} | Locked: {self.locked}'
 
     def has_wrapped_model_info(self):
         if self.additional_info is not None:
@@ -192,6 +246,7 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
                 return getattr(self, model_id)
             except ObjectDoesNotExist:
                 pass
+        return False
 
     def remove_wrapped_model_info(self):
         if self.has_wrapped_model_info():
@@ -348,6 +403,28 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
             self.is_posted()
         ])
 
+    def can_hide(self) -> bool:
+        """
+        Determines if the LedgerModel can be hidden.
+
+        Returns
+        -------
+        bool
+            True if can be hidden, else False.
+        """
+        return self.hidden is False
+
+    def can_unhide(self) -> bool:
+        """
+        Determines if the LedgerModel can be un-hidden.
+
+        Returns
+        -------
+        bool
+            True if can be un-hidden, else False.
+        """
+        return self.hidden is True
+
     def can_delete(self) -> bool:
         if all([
             not self.is_locked(),
@@ -375,7 +452,7 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
         if not self.can_post():
             if raise_exception:
                 raise LedgerModelValidationError(
-                    message=_(f'Ledger {self.uuid} cannot be posted.')
+                    message=_(f'Ledger {self.name} cannot be posted. UUID: {self.uuid}')
                 )
             return
         self.posted = True
@@ -384,6 +461,10 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
                 'posted',
                 'updated'
             ])
+        ledger_posted.send_robust(sender=self.__class__,
+                                  instance=self,
+                                  commited=commit,
+                                  **kwargs)
 
     def post_journal_entries(self, commit: bool = True, **kwargs):
         je_model_qs = self.journal_entries.unposted()
@@ -404,7 +485,7 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
         raise_exception:bool
             Raises LedgerModelValidationError if un-posting not allowed.
         """
-        if self.can_unpost():
+        if not self.can_unpost():
             if raise_exception:
                 raise LedgerModelValidationError(
                     message=_(f'Ledger {self.uuid} cannot be unposted.')
@@ -416,8 +497,12 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
                 'posted',
                 'updated'
             ])
+        ledger_unposted.send_robust(sender=self.__class__,
+                                    instance=self,
+                                    commited=commit,
+                                    **kwargs)
 
-    def lock(self, commit: bool = False, **kwargs):
+    def lock(self, commit: bool = False, raise_exception: bool = True, **kwargs):
         """
         Locks the LedgerModel.
 
@@ -425,14 +510,26 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
         ----------
         commit: bool
             If True, saves the LedgerModel instance instantly. Defaults to False.
+        raise_exception: bool
+            Raises LedgerModelValidationError if locking not allowed.
         """
-        if self.can_lock():
-            self.locked = True
-            if commit:
-                self.save(update_fields=[
-                    'locked',
-                    'updated'
-                ])
+
+        if not self.can_lock():
+            if raise_exception:
+                raise LedgerModelValidationError(
+                    message=_(f'Ledger {self.name} cannot be locked. UUID: {self.uuid}')
+                )
+            return
+        self.locked = True
+        if commit:
+            self.save(update_fields=[
+                'locked',
+                'updated'
+            ])
+        ledger_locked.send_robust(sender=self.__class__,
+                                  instance=self,
+                                  commited=commit,
+                                  **kwargs)
 
     def lock_journal_entries(self, commit: bool = True, **kwargs):
         je_model_qs = self.journal_entries.unlocked()
@@ -442,7 +539,7 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
             je_model_qs.bulk_update(objs=je_model_qs, fields=['locked', 'updated'])
         return je_model_qs
 
-    def unlock(self, commit: bool = False, **kwargs):
+    def unlock(self, commit: bool = False, raise_exception: bool = True, **kwargs):
         """
         Un-locks the LedgerModel.
 
@@ -451,13 +548,59 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
         commit: bool
             If True, saves the LedgerModel instance instantly. Defaults to False.
         """
-        if self.can_unlock():
-            self.locked = False
-            if commit:
-                self.save(update_fields=[
-                    'locked',
-                    'updated'
-                ])
+        if not self.can_unlock():
+            if raise_exception:
+                raise LedgerModelValidationError(
+                    message=_(f'Ledger {self.name} cannot be un-locked. UUID: {self.uuid}')
+                )
+            return
+
+        self.locked = False
+        if commit:
+            self.save(update_fields=[
+                'locked',
+                'updated'
+            ])
+        ledger_unlocked.send_robust(sender=self.__class__,
+                                    instance=self,
+                                    commited=commit,
+                                    **kwargs)
+
+    def hide(self, commit: bool = False, raise_exception: bool = True, **kwargs):
+        if not self.can_hide():
+            if raise_exception:
+                raise LedgerModelValidationError(
+                    message=_(f'Ledger {self.name} cannot be hidden. UUID: {self.uuid}')
+                )
+            return
+        self.hidden = True
+        if commit:
+            self.save(update_fields=[
+                'hidden',
+                'updated'
+            ])
+        ledger_hidden.send_robust(sender=self.__class__,
+                                  instance=self,
+                                  commited=commit,
+                                  **kwargs)
+
+    def unhide(self, commit: bool = False, raise_exception: bool = True, **kwargs):
+        if not self.can_unhide():
+            if raise_exception:
+                raise LedgerModelValidationError(
+                    message=_(f'Ledger {self.name} cannot be un-hidden. UUID: {self.uuid}')
+                )
+            return
+        self.hidden = False
+        if commit:
+            self.save(update_fields=[
+                'hidden',
+                'updated'
+            ])
+        ledger_unhidden.send_robust(sender=self.__class__,
+                                    instance=self,
+                                    commited=commit,
+                                    **kwargs)
 
     def delete(self, **kwargs):
         if not self.can_delete():
@@ -465,16 +608,18 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
                 message=_(f'LedgerModel {self.name} cannot be deleted because posted is {self.is_posted()} '
                           f'and locked is {self.is_locked()}')
             )
-        earliest_je_timestamp = self.journal_entries.posted().order_by('-timestamp').values('timestamp').first()
-        if earliest_je_timestamp is not None:
-            earliest_date = earliest_je_timestamp['timestamp'].date()
-            if earliest_date <= self.entity.last_closing_date:
-                raise LedgerModelValidationError(
-                    message=_(
-                        f'Journal Entries with date {earliest_date} cannot be deleted because of lastest closing '
-                        f'entry on {self.get_entity_last_closing_date()}')
-                )
 
+        # checks if ledger model has journal entries in a closed period...
+        if self.entity.has_closing_entry():
+            earliest_je_timestamp = self.journal_entries.posted().order_by('-timestamp').values('timestamp').first()
+            if earliest_je_timestamp is not None:
+                earliest_date = earliest_je_timestamp['timestamp'].date()
+                if earliest_date <= self.entity.last_closing_date:
+                    raise LedgerModelValidationError(
+                        message=_(
+                            f'Journal Entries with date {earliest_date} cannot be deleted because of latest closing '
+                            f'entry on {self.get_entity_last_closing_date()}')
+                    )
         return super().delete(**kwargs)
 
     def get_entity_name(self) -> str:
@@ -493,9 +638,8 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
         str
             URL as a string.
         """
-        return reverse('django_ledger:ledger-detail',
+        return reverse(viewname='django_ledger:je-list',
                        kwargs={
-                           # pylint: disable=no-member
                            'entity_slug': self.entity.slug,
                            'ledger_pk': self.uuid
                        })
@@ -529,6 +673,21 @@ class LedgerModelAbstract(CreateUpdateMixIn, IOMixIn):
                        kwargs={
                            'entity_slug': self.entity.slug,
                            'ledger_pk': self.uuid
+                       })
+
+    def get_list_url(self) -> str:
+        """
+        Determines the list URL of the LedgerModel instances.
+        Results in additional Database query if entity field is not selected in QuerySet.
+
+        Returns
+        -------
+        str
+            URL as a string.
+        """
+        return reverse('django_ledger:ledger-list',
+                       kwargs={
+                           'entity_slug': self.entity.slug
                        })
 
     def get_balance_sheet_url(self):
@@ -566,6 +725,9 @@ class LedgerModel(LedgerModelAbstract):
     """
     Base LedgerModel from Abstract.
     """
+    class Meta(LedgerModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_LEDGER_MODEL'
+        abstract = False
 
 
 def ledgermodel_presave(instance: LedgerModel, **kwargs):

@@ -1,9 +1,6 @@
 """
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
-
-Contributions to this module:
-Miguel Sanda <msanda@arrobalytics.com>
 """
 
 from decimal import Decimal
@@ -12,44 +9,67 @@ from uuid import uuid4
 
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.db.models import Q, Count, Sum, Case, When, F, Value, DecimalField, BooleanField
+from django.db.models import Q, Count, Sum, Case, When, F, Value, DecimalField, BooleanField, Manager, QuerySet
 from django.db.models.functions import Coalesce
 from django.db.models.signals import pre_save
 from django.utils.translation import gettext_lazy as _
 
 from django_ledger.io import ASSET_CA_CASH, CREDIT, DEBIT
+from django_ledger.models import JournalEntryModel
 from django_ledger.models.mixins import CreateUpdateMixIn
 from django_ledger.models.utils import lazy_loader
-
-from django_ledger.models import JournalEntryModel
 
 
 class ImportJobModelValidationError(ValidationError):
     pass
 
 
-class ImportJobModelQuerySet(models.QuerySet):
+class ImportJobModelQuerySet(QuerySet):
     pass
 
 
-class ImportJobModelManager(models.Manager):
+class ImportJobModelManager(Manager):
 
     def get_queryset(self):
         qs = super().get_queryset()
-        return qs.select_related(
+        return qs.annotate(
+            txs_count=Count('stagedtransactionmodel',
+                            filter=Q(stagedtransactionmodel__parent__isnull=False)),
+            txs_mapped_count=Count(
+                'stagedtransactionmodel__account_model_id',
+                filter=Q(stagedtransactionmodel__parent__isnull=False) | Q(
+                    stagedtransactionmodel__parent__parent__isnull=False)
+
+            ),
+        ).annotate(
+            txs_pending=F('txs_count') - F('txs_mapped_count')
+        ).annotate(
+            is_complete=Case(
+                When(txs_count__exact=0, then=False),
+                When(txs_pending__exact=0, then=True),
+                default=False,
+                output_field=BooleanField()
+            ),
+        ).select_related(
             'bank_account_model',
             'bank_account_model__cash_account',
             'ledger_model'
         )
 
-    def for_entity(self, entity_slug: str, user_model):
+    def for_user(self, user_model):
         qs = self.get_queryset()
+        if user_model.is_superuser:
+            return qs
         return qs.filter(
-            Q(bank_account_model__entity_model__slug__exact=entity_slug) &
-            (
-                    Q(bank_account_model__entity_model__admin=user_model) |
-                    Q(bank_account_model__entity_model__managers__in=[user_model])
-            )
+            Q(bank_account_model__entity_model__admin=user_model) |
+            Q(bank_account_model__entity_model__managers__in=[user_model])
+
+        )
+
+    def for_entity(self, entity_slug: str, user_model):
+        qs = self.for_user(user_model)
+        return qs.filter(
+            Q(bank_account_model__entity_model__slug__exact=entity_slug)
         )
 
 
@@ -99,7 +119,7 @@ class ImportJobModelAbstract(CreateUpdateMixIn):
         return _(f'Are you sure you want to delete Import Job {self.description}?')
 
 
-class StagedTransactionModelQuerySet(models.QuerySet):
+class StagedTransactionModelQuerySet(QuerySet):
 
     def is_pending(self):
         return self.filter(transaction_model__isnull=True)
@@ -114,7 +134,7 @@ class StagedTransactionModelQuerySet(models.QuerySet):
         return self.filter(ready_to_import=True)
 
 
-class StagedTransactionModelManager(models.Manager):
+class StagedTransactionModelManager(Manager):
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -136,6 +156,7 @@ class StagedTransactionModelManager(models.Manager):
                 When(parent_id__isnull=False, then=F('parent_id'))
             ),
         ).annotate(
+            entity_unit=F('transaction_model__journal_entry__entity_unit__name'),
             ready_to_import=Case(
                 # is mapped singleton...
                 When(
@@ -499,6 +520,10 @@ class ImportJobModel(ImportJobModelAbstract):
     Transaction Import Job Model Base Class.
     """
 
+    class Meta(ImportJobModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_IMPORT_JOB_MODEL'
+        abstract = False
+
 
 def importjobmodel_presave(instance: ImportJobModel, **kwargs):
     if instance.is_configured():
@@ -515,3 +540,7 @@ class StagedTransactionModel(StagedTransactionModelAbstract):
     """
     Staged Transaction Model Base Class.
     """
+
+    class Meta(StagedTransactionModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_STAGED_TRANSACTION_MODEL'
+        abstract = False

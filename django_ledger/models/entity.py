@@ -2,16 +2,13 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
-    * Pranav P Tulshyan ptulshyan77@gmail.com<>
-
 The EntityModel represents the Company, Corporation, Legal Entity, Enterprise or Person that engage and operate as a
 business. EntityModels can be created as part of a parent/child model structure to accommodate complex corporate
 structures where certain entities may be owned by other entities and may also generate consolidated financial statements.
+
 Another use case of parent/child model structures is the coordination and authorization of inter-company transactions
-across multiple related entities. The EntityModel encapsulates all LedgerModel, JournalEntryModel and TransactionModel which is the core structure of
-Django Ledger in order to track and produce all financials.
+across multiple related entities. The EntityModel encapsulates all LedgerModel, JournalEntryModel and TransactionModel
+which is the core structure of Django Ledger in order to track and produce all financials.
 
 The EntityModel must be assigned an Administrator at creation, and may have optional Managers that will have the ability
 to operate on such EntityModel.
@@ -27,7 +24,7 @@ from decimal import Decimal
 from itertools import zip_longest
 from random import choices
 from string import ascii_lowercase, digits
-from typing import Tuple, Union, Optional, List, Dict
+from typing import Tuple, Union, Optional, List, Dict, Set
 from uuid import uuid4, UUID
 
 from django.contrib.auth import get_user_model
@@ -36,19 +33,18 @@ from django.core.cache import caches
 from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from django.core.validators import MinValueValidator
 from django.db import models
-from django.db.models import Q, QuerySet
+from django.db.models import Q, F, Model
 from django.db.models.signals import pre_save
 from django.urls import reverse
 from django.utils.text import slugify
-from django.utils.timezone import localtime, localdate
 from django.utils.translation import gettext_lazy as _
 from treebeard.mp_tree import MP_Node, MP_NodeManager, MP_NodeQuerySet
 
 from django_ledger.io import roles as roles_module, validate_roles, IODigestContextManager
-from django_ledger.io.io_mixin import IOMixIn
+from django_ledger.io.io_core import IOMixIn, get_localtime, get_localdate
 from django_ledger.models.accounts import AccountModel, AccountModelQuerySet, DEBIT, CREDIT
 from django_ledger.models.bank_account import BankAccountModelQuerySet, BankAccountModel
-from django_ledger.models.coa import ChartOfAccountModel, ChartOfAccountModelQuerySet
+from django_ledger.models.chart_of_accounts import ChartOfAccountModel, ChartOfAccountModelQuerySet
 from django_ledger.models.coa_default import CHART_OF_ACCOUNTS_ROOT_MAP
 from django_ledger.models.customer import CustomerModelQueryset, CustomerModel
 from django_ledger.models.items import (ItemModelQuerySet, ItemTransactionModelQuerySet,
@@ -114,10 +110,16 @@ class EntityModelManager(MP_NodeManager):
 
     def get_queryset(self):
         """Sets the custom queryset as the default."""
-        qs = super().get_queryset()
-        return qs.order_by('path').select_related('admin', 'default_coa')
+        qs = EntityModelQuerySet(
+            self.model,
+            using=self._db).order_by('path')
+        return qs.order_by('path').select_related(
+            'admin',
+            'default_coa').annotate(
+            _default_coa_slug=F('default_coa__slug'),
+        )
 
-    def for_user(self, user_model):
+    def for_user(self, user_model, authorized_superuser: bool = False):
         """
         This QuerySet guarantees that Users do not access or operate on EntityModels that don't have access to.
         This is the recommended initial QuerySet.
@@ -126,6 +128,8 @@ class EntityModelManager(MP_NodeManager):
         ----------
         user_model
             The Django User Model making the request.
+        authorized_superuser
+            Allows any superuser to access the EntityModel. Default is False.
 
         Returns
         -------
@@ -135,6 +139,8 @@ class EntityModelManager(MP_NodeManager):
                 2. Is a manager.
         """
         qs = self.get_queryset()
+        if user_model.is_superuser and authorized_superuser:
+            return qs
         return qs.filter(
             Q(admin=user_model) |
             Q(managers__in=[user_model])
@@ -418,6 +424,9 @@ class EntityModelFiscalPeriodMixIn:
 
 
 class EntityModelClosingEntryMixIn:
+    """
+    Closing Entries provide
+    """
 
     def validate_closing_entry_model(self, closing_entry_model, closing_date: Optional[date] = None):
         if isinstance(self, EntityModel):
@@ -516,7 +525,6 @@ class EntityModelClosingEntryMixIn:
         return self.get_closing_entry_queryset_for_date(closing_date=closing_date)
 
     # ----> Create Closing Entries <----
-
     def create_closing_entry_for_date(self,
                                       closing_date: date,
                                       closing_entry_model=None,
@@ -525,7 +533,7 @@ class EntityModelClosingEntryMixIn:
         if closing_entry_model:
             self.validate_closing_entry_model(closing_entry_model, closing_date=closing_date)
 
-        if closing_date > localdate():
+        if closing_date > get_localdate():
             raise EntityModelValidationError(
                 message=_(f'Cannot create closing entry with a future date {closing_date}.')
             )
@@ -575,7 +583,6 @@ class EntityModelClosingEntryMixIn:
         return f'closing_entry_{end_dt_str}_{self.uuid}'
 
     # ----> Closing Entry Caching Month < -----
-
     def get_closing_entry_cache_for_date(self,
                                          closing_date: date,
                                          cache_name: str = 'default',
@@ -794,6 +801,17 @@ class EntityModelAbstract(MP_Node,
     def __str__(self):
         return f'EntityModel {self.slug}: {self.name}'
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._CLOSING_ENTRY_DATES: Optional[List[date]] = None
+
+    @property
+    def default_coa_slug(self):
+        try:
+            return getattr(self, '_default_coa_slug')
+        except AttributeError:
+            return self.default_coa.slug
+
     # ## Logging ###
     def get_logger_name(self):
         return f'EntityModel {self.uuid}'
@@ -890,8 +908,15 @@ class EntityModelAbstract(MP_Node,
         return user_model.id == self.admin_id
 
     # #### LEDGER MANAGEMENT....
-    def create_ledger(self, name):
-        return self.ledgermodel_set.create(name=name)
+    def create_ledger(self, name: str, ledger_xid: Optional[str] = None, posted: bool = False, commit: bool = True):
+        if commit:
+            return self.ledgermodel_set.create(name=name, ledger_xid=ledger_xid, posted=posted)
+        return LedgerModel(
+            entity=self,
+            posted=posted,
+            name=name,
+            ledger_xid=ledger_xid
+        )
 
     # #### SLUG GENERATION ###
     @staticmethod
@@ -978,6 +1003,21 @@ class EntityModelAbstract(MP_Node,
                 raise EntityModelValidationError(f'EntityModel {self.slug} does not have a default CoA')
         return self.default_coa
 
+    def set_default_coa(self, coa_model: Optional[Union[ChartOfAccountModel, str]], commit: bool = False):
+
+        # if str, will look up CoA Model by slug...
+        if isinstance(coa_model, str):
+            coa_model = self.chartofaccountmodel_set.get(slug=coa_model)
+        else:
+            self.validate_chart_of_accounts_for_entity(coa_model)
+
+        self.default_coa = coa_model
+        if commit:
+            self.save(update_fields=[
+                'default_coa',
+                'updated'
+            ])
+
     def create_chart_of_accounts(self,
                                  assign_as_default: bool = False,
                                  coa_name: Optional[str] = None,
@@ -1007,10 +1047,10 @@ class EntityModelAbstract(MP_Node,
             coa_name = 'Default CoA'
 
         chart_of_accounts = ChartOfAccountModel(
-            slug=self.slug + ''.join(choices(ENTITY_RANDOM_SLUG_SUFFIX, k=6)) + '-coa',
             name=coa_name,
             entity=self
         )
+
         chart_of_accounts.clean()
         chart_of_accounts.save()
         chart_of_accounts.configure()
@@ -1063,17 +1103,17 @@ class EntityModelAbstract(MP_Node,
         coa_has_accounts = coa_accounts_qs.not_coa_root().exists()
 
         if not coa_has_accounts or force:
-            root_accounts = coa_accounts_qs.is_coa_root()
+            root_account_qs = coa_accounts_qs.is_coa_root()
 
             root_maps = {
-                root_accounts.get(role__exact=k): [
+                root_account_qs.get(role__exact=k): [
                     AccountModel(
                         code=a['code'],
                         name=a['name'],
                         role=a['role'],
                         balance_type=a['balance_type'],
                         active=activate_accounts,
-                        # coa_model=chart_of_accounts,
+                        coa_model=coa_model,
                     ) for a in v] for k, v in CHART_OF_ACCOUNTS_ROOT_MAP.items()
             }
 
@@ -1088,12 +1128,33 @@ class EntityModelAbstract(MP_Node,
                         pass
 
                     account_model.clean()
-                    coa_model.create_account(account_model)
+                    coa_model.insert_account(account_model, root_account_qs=root_account_qs)
 
         else:
             if not ignore_if_default_coa:
-                raise EntityModelValidationError(f'Entity {self.name} already has existing accounts. '
-                                                 'Use force=True to bypass this check')
+                raise EntityModelValidationError(
+                    f'Entity {self.name} already has existing accounts. '
+                    'Use force=True to bypass this check'
+                )
+
+    def get_coa_model_qs(self, active: bool = True):
+        """
+        Fetches the current Entity Model instance Chart of Accounts Model Queryset.
+
+        Parameters
+        ----------
+        active: bool
+            Returns only active Chart of Account Models. Defaults to True.
+
+        Returns
+        -------
+        ChartOfAccountModelQuerySet
+        """
+
+        coa_model_qs = self.chartofaccountmodel_set.all()
+        if active:
+            return coa_model_qs.active()
+        return coa_model_qs
 
     # Model Validators....
     def validate_chart_of_accounts_for_entity(self,
@@ -1222,7 +1283,10 @@ class EntityModelAbstract(MP_Node,
     def get_coa_accounts(self,
                          coa_model: Optional[Union[ChartOfAccountModel, UUID, str]] = None,
                          active: bool = True,
-                         order_by: Optional[Tuple] = ('code',)) -> AccountModelQuerySet:
+                         locked: bool = False,
+                         order_by: Optional[Tuple] = ('code',),
+                         return_coa_model: bool = False,
+                         ) -> Union[AccountModelQuerySet, Tuple[ChartOfAccountModel, AccountModelQuerySet]]:
         """
         Fetches the AccountModelQuerySet for a specific ChartOfAccountModel.
 
@@ -1232,6 +1296,8 @@ class EntityModelAbstract(MP_Node,
             The ChartOfAccountsModel UUID, model instance or slug to pull accounts from. If None, will use default CoA.
         active: bool
             Selects only active accounts.
+        locked: bool
+            Selects only locked accounts.
         order_by: list of strings.
             Optional list of fields passed to the order_by QuerySet method.
 
@@ -1242,26 +1308,31 @@ class EntityModelAbstract(MP_Node,
         """
 
         if not coa_model:
-            account_model_qs = self.default_coa.accountmodel_set.all().select_related('coa_model', 'coa_model__entity')
+            coa_model = self.default_coa
+        elif isinstance(coa_model, UUID):
+            coa_model = self.chartofaccountmodel_set.select_related('entity').get(uuid__exact=coa_model)
+        elif isinstance(coa_model, str):
+            coa_model = self.chartofaccountmodel_set.select_related('entity').get(slug__exact=coa_model)
+        elif isinstance(coa_model, ChartOfAccountModel):
+            self.validate_chart_of_accounts_for_entity(coa_model=coa_model)
         else:
-            account_model_qs = AccountModel.objects.filter(
-                coa_model__entity__uuid__exact=self.uuid
-            ).select_related('coa_model', 'coa_model__entity')
+            raise EntityModelValidationError(
+                f'CoA Model {coa_model} must be an instance of ChartOfAccountModel, UUID, str or None.'
+            )
 
-            if isinstance(coa_model, ChartOfAccountModel):
-                self.validate_chart_of_accounts_for_entity(coa_model=coa_model, raise_exception=True)
-                account_model_qs = coa_model.accountmodel_set.all()
-            if isinstance(coa_model, str):
-                account_model_qs = account_model_qs.filter(coa_model__slug__exact=coa_model)
-            elif isinstance(coa_model, UUID):
-                account_model_qs = account_model_qs.filter(coa_model__uuid__exact=coa_model)
+        account_model_qs = coa_model.accountmodel_set.select_related('coa_model', 'coa_model__entity').not_coa_root()
 
         if active:
             account_model_qs = account_model_qs.active()
 
+        if locked:
+            account_model_qs = account_model_qs.locked()
+
         if order_by:
             account_model_qs = account_model_qs.order_by(*order_by)
 
+        if return_coa_model:
+            return coa_model, account_model_qs
         return account_model_qs
 
     def get_default_coa_accounts(self,
@@ -1293,7 +1364,7 @@ class EntityModelAbstract(MP_Node,
         return self.get_coa_accounts(active=active, order_by=order_by)
 
     def get_accounts_with_codes(self,
-                                code_list: Union[str, List[str]],
+                                code_list: Union[str, List[str], Set[str]],
                                 coa_model: Optional[Union[ChartOfAccountModel, UUID, str]] = None
                                 ) -> AccountModelQuerySet:
         """
@@ -1351,11 +1422,68 @@ class EntityModelAbstract(MP_Node,
         return account_model_qs.get(role__exact=role)
 
     def create_account(self,
-                       account_model_kwargs: Dict,
+                       code: str,
+                       role: str,
+                       name: str,
+                       balance_type: str,
+                       active: bool = False,
                        coa_model: Optional[Union[ChartOfAccountModel, UUID, str]] = None,
-                       raise_exception: bool = True) -> Tuple[ChartOfAccountModel, AccountModel]:
+                       raise_exception: bool = True) -> AccountModel:
         """
         Creates a new AccountModel for the EntityModel.
+
+        Parameters
+        ----------
+        code: str
+            The AccountModel code of the new Account.
+        role: str
+            The choice of role that the new Account belongs to.
+        name: str
+            The name of the new Account.
+        balance_type: str
+            The balance type of the new account. Possible values are 'debit' or 'credit'.
+        active: bool
+            Active status of the new account.
+        coa_model: ChartOfAccountModel, UUID, str
+            The ChartOfAccountsModel UUID, model instance or slug to pull accounts from. Uses default Coa if not
+            provided.
+        raise_exception: bool
+            Raises EntityModelValidationError if ChartOfAccountsModel is not valid for the EntityModel instance.
+
+        Returns
+        -------
+        A tuple of ChartOfAccountModel, AccountModel
+            The ChartOfAccountModel and AccountModel instance just created.
+        """
+        if coa_model:
+            if isinstance(coa_model, UUID):
+                coa_model = self.chartofaccountsmodel_set.get(uuid__exact=coa_model)
+            elif isinstance(coa_model, str):
+                coa_model = self.chartofaccountsmodel_set.get(slug__exact=coa_model)
+            elif isinstance(coa_model, ChartOfAccountModel):
+                self.validate_chart_of_accounts_for_entity(
+                    coa_model=coa_model,
+                    raise_exception=raise_exception
+                )
+        else:
+            coa_model = self.default_coa
+
+        return coa_model.create_account(
+            code=code,
+            role=role,
+            name=name,
+            balance_type=balance_type,
+            active=active
+        )
+
+    def create_account_by_kwargs(self,
+                                 account_model_kwargs: Dict,
+                                 coa_model: Optional[Union[ChartOfAccountModel, UUID, str]] = None,
+                                 raise_exception: bool = True) -> Tuple[ChartOfAccountModel, AccountModel]:
+        """
+        Creates a new AccountModel for the EntityModel by passing AccountModel KWARGS.
+        This is a legacy method for creating a new AccountModel for the EntityModel.
+        Will be deprecated in favor of create_account().
 
         Parameters
         ----------
@@ -1378,13 +1506,36 @@ class EntityModelAbstract(MP_Node,
             elif isinstance(coa_model, str):
                 coa_model = self.chartofaccountsmodel_set.get(slug__exact=coa_model)
             elif isinstance(coa_model, ChartOfAccountModel):
-                self.validate_chart_of_accounts_for_entity(coa_model=coa_model, raise_exception=raise_exception)
+                self.validate_chart_of_accounts_for_entity(
+                    coa_model=coa_model,
+                    raise_exception=raise_exception
+                )
         else:
             coa_model = self.default_coa
 
-        account_model = AccountModel(**account_model_kwargs)
-        account_model.clean()
-        return coa_model, coa_model.create_account(account_model=account_model)
+        # account_model = AccountModel(**account_model_kwargs)
+        # account_model.clean()
+        return coa_model, coa_model.create_account(**account_model_kwargs)
+
+    # ### LEDGER MANAGEMENT ####
+    def get_ledgers(self, posted: bool = True):
+        return self.ledgermodel_set.filter(posted=posted)
+
+    # ### JOURNAL ENTRY MANAGEMENT ####
+    def get_journal_entries(self, ledger_model: LedgerModel, posted: bool = True):
+
+        if ledger_model:
+            self.validate_ledger_model_for_entity(ledger_model)
+            qs = ledger_model.journal_entries.all()
+            if posted:
+                return qs.posted()
+            return qs
+
+        JournalEntryModel = lazy_loader.get_journal_entry_model()
+        qs = JournalEntryModel.objects.for_entity(entity_slug=self)
+        if posted:
+            return qs.posted()
+        return qs
 
     # ### VENDOR MANAGEMENT ####
     def get_vendors(self, active: bool = True) -> VendorModelQuerySet:
@@ -1564,11 +1715,12 @@ class EntityModelAbstract(MP_Node,
 
         account_model_qs = self.get_coa_accounts(coa_model=coa_model, active=True)
 
-        account_model_qs = account_model_qs.with_roles(roles=[
-            roles_module.ASSET_CA_CASH,
-            roles_module.ASSET_CA_PREPAID,
-            roles_module.LIABILITY_CL_ACC_PAYABLE
-        ]).is_role_default()
+        account_model_qs = account_model_qs.with_roles(
+            roles=[
+                roles_module.ASSET_CA_CASH,
+                roles_module.ASSET_CA_PREPAID,
+                roles_module.LIABILITY_CL_ACC_PAYABLE
+            ]).is_role_default()
 
         # evaluates the queryset...
         len(account_model_qs)
@@ -1673,11 +1825,12 @@ class EntityModelAbstract(MP_Node,
             raise EntityModelValidationError('CustomerModel must be an instance of CustomerModel, UUID or str.')
 
         account_model_qs = self.get_coa_accounts(coa_model=coa_model, active=True)
-        account_model_qs = account_model_qs.with_roles(roles=[
-            roles_module.ASSET_CA_CASH,
-            roles_module.ASSET_CA_RECEIVABLES,
-            roles_module.LIABILITY_CL_DEFERRED_REVENUE
-        ]).is_role_default()
+        account_model_qs = account_model_qs.with_roles(
+            roles=[
+                roles_module.ASSET_CA_CASH,
+                roles_module.ASSET_CA_RECEIVABLES,
+                roles_module.LIABILITY_CL_DEFERRED_REVENUE
+            ]).is_role_default()
 
         # evaluates the queryset...
         len(account_model_qs)
@@ -1868,7 +2021,9 @@ class EntityModelAbstract(MP_Node,
             raise EntityModelValidationError(
                 _(f'Invalid Account Type: choices are {BankAccountModel.VALID_ACCOUNT_TYPES}'))
         account_model_qs = self.get_coa_accounts(coa_model=coa_model, active=True)
-        account_model_qs = account_model_qs.with_roles(roles=roles_module.ASSET_CA_CASH).is_role_default()
+        account_model_qs = account_model_qs.with_roles(
+            roles=roles_module.ASSET_CA_CASH
+        ).is_role_default()
         bank_account_model = BankAccountModel(
             name=name,
             entity_model=self,
@@ -2024,11 +2179,12 @@ class EntityModelAbstract(MP_Node,
                 raise EntityModelValidationError(f'Invalid UnitOfMeasureModel for entity {self.slug}...')
 
         account_model_qs = self.get_coa_accounts(coa_model=coa_model, active=True)
-        account_model_qs = account_model_qs.with_roles(roles=[
-            roles_module.ASSET_CA_INVENTORY,
-            roles_module.COGS,
-            roles_module.INCOME_OPERATIONAL
-        ]).is_role_default()
+        account_model_qs = account_model_qs.with_roles(
+            roles=[
+                roles_module.ASSET_CA_INVENTORY,
+                roles_module.COGS,
+                roles_module.INCOME_OPERATIONAL
+            ]).is_role_default()
 
         # evaluates the queryset...
         len(account_model_qs)
@@ -2099,10 +2255,11 @@ class EntityModelAbstract(MP_Node,
                 raise EntityModelValidationError(f'Invalid UnitOfMeasureModel for entity {self.slug}...')
 
         account_model_qs = self.get_coa_accounts(coa_model=coa_model, active=True)
-        account_model_qs = account_model_qs.with_roles(roles=[
-            roles_module.COGS,
-            roles_module.INCOME_OPERATIONAL
-        ]).is_role_default()
+        account_model_qs = account_model_qs.with_roles(
+            roles=[
+                roles_module.COGS,
+                roles_module.INCOME_OPERATIONAL
+            ]).is_role_default()
 
         # evaluates the queryset...
         len(account_model_qs)
@@ -2178,7 +2335,9 @@ class EntityModelAbstract(MP_Node,
                 raise EntityModelValidationError(f'Invalid UnitOfMeasureModel for entity {self.slug}...')
 
         account_model_qs = self.get_coa_accounts(coa_model=coa_model, active=True)
-        account_model_qs = account_model_qs.with_roles(roles=roles_module.EXPENSE_OPERATIONAL)
+        account_model_qs = account_model_qs.with_roles(
+            roles=roles_module.EXPENSE_OPERATIONAL
+        )
         if not expense_account:
             expense_account = account_model_qs.is_role_default().get()
         elif isinstance(expense_account, UUID):
@@ -2277,7 +2436,9 @@ class EntityModelAbstract(MP_Node,
                 raise EntityModelValidationError(f'Invalid UnitOfMeasureModel for entity {self.slug}...')
 
         account_model_qs = self.get_coa_accounts(coa_model=coa_model, active=True)
-        account_model_qs = account_model_qs.with_roles(roles=roles_module.ASSET_CA_INVENTORY)
+        account_model_qs = account_model_qs.with_roles(
+            roles=roles_module.ASSET_CA_INVENTORY
+        )
         if not inventory_account:
             inventory_account = account_model_qs.is_role_default().get()
         elif isinstance(inventory_account, UUID):
@@ -2497,7 +2658,9 @@ class EntityModelAbstract(MP_Node,
             ROLES_NEEDED.append(roles_module.EQUITY_CAPITAL)
 
         account_model_qs = self.get_coa_accounts(coa_model=coa_model)
-        account_model_qs = account_model_qs.with_roles(roles=ROLES_NEEDED).is_role_default()
+        account_model_qs = account_model_qs.with_roles(
+            roles=ROLES_NEEDED
+        ).is_role_default()
 
         if not cash_account or not capital_account:
             if cash_account or capital_account:
@@ -2518,7 +2681,7 @@ class EntityModelAbstract(MP_Node,
             capital_account = account_model_qs.filter(role__exact=roles_module.EQUITY_CAPITAL).get()
 
         if not je_timestamp:
-            je_timestamp = localtime()
+            je_timestamp = get_localtime()
 
         if not description:
             description = f'Capital Deposit on {je_timestamp.isoformat()}...'
@@ -2587,11 +2750,12 @@ class EntityModelAbstract(MP_Node,
 
         self.meta[self.META_KEY_CLOSING_ENTRY_DATES] = [d.isoformat() for d in date_list]
         if commit:
-            self.save(update_fields=[
-                'last_closing_date',
-                'updated',
-                'meta'
-            ])
+            self.save(
+                update_fields=[
+                    'last_closing_date',
+                    'updated',
+                    'meta'
+                ])
         return date_list
 
     def fetch_closing_entry_dates_meta(self, as_date: bool = True) -> List[date]:
@@ -2599,25 +2763,43 @@ class EntityModelAbstract(MP_Node,
             return list()
         date_list = self.meta[self.META_KEY_CLOSING_ENTRY_DATES]
         if as_date:
-            return [date.fromisoformat(dt) for dt in date_list]
+            if self._CLOSING_ENTRY_DATES is None:
+                self._CLOSING_ENTRY_DATES = [date.fromisoformat(dt) for dt in date_list]
+            return self._CLOSING_ENTRY_DATES
         return date_list
 
-    def get_closing_entry_for_date(self, io_date: date, inclusive: bool = True) -> Optional[date]:
+    def get_closing_entry_for_date(self, io_date: Union[date, datetime], inclusive: bool = True) -> Optional[date]:
         if io_date is None:
             return
         ce_date_list = self.fetch_closing_entry_dates_meta()
+
+        if not ce_date_list:
+            return
+
+        if isinstance(io_date, datetime):
+            io_date = io_date.date()
+
         ce_lookup = io_date - timedelta(days=1) if not inclusive else io_date
         if ce_lookup in ce_date_list:
             return ce_lookup
 
-    def get_nearest_next_closing_entry(self, io_date: date) -> Optional[date]:
+    def get_nearest_next_closing_entry(self, io_date: Union[date, datetime]) -> Optional[date]:
         if io_date is None:
             return
+
         ce_date_list = self.fetch_closing_entry_dates_meta()
         if not len(ce_date_list):
             return
+
+        if all([
+            isinstance(io_date, date),
+            isinstance(io_date, datetime),
+        ]):
+            io_date = io_date.date()
+
         if io_date > ce_date_list[0]:
             return ce_date_list[0]
+
         for f, p in zip_longest(ce_date_list, ce_date_list[1:]):
             if p and p <= io_date < f:
                 return p
@@ -2626,7 +2808,7 @@ class EntityModelAbstract(MP_Node,
                            closing_date: Optional[date] = None,
                            closing_entry_model=None,
                            force_update: bool = False,
-                           commit: bool = True):
+                           post_closing_entry: bool = True):
 
         if closing_entry_model and closing_date:
             raise EntityModelValidationError(
@@ -2638,13 +2820,18 @@ class EntityModelAbstract(MP_Node,
             )
 
         closing_entry_exists = False
+
         if closing_entry_model:
             closing_date = closing_entry_model.closing_date
             self.validate_closing_entry_model(closing_entry_model, closing_date=closing_date)
             closing_entry_exists = True
         else:
             try:
-                closing_entry_model = self.closingentrymodel_set.defer('markdown_notes').get(
+                closing_entry_model = self.closingentrymodel_set.select_related(
+                    'ledger_model',
+                    'ledger_model__entity'
+                ).defer(
+                    'markdown_notes').get(
                     closing_date__exact=closing_date
                 )
 
@@ -2653,29 +2840,34 @@ class EntityModelAbstract(MP_Node,
                 pass
 
         if force_update or not closing_entry_exists or closing_entry_model:
-            ce_model, ce_txs = self.create_closing_entry_for_date(
+            closing_entry_model, ce_txs = self.create_closing_entry_for_date(
                 closing_date=closing_date,
                 closing_entry_model=closing_entry_model,
-                closing_entry_exists=closing_entry_exists
+                closing_entry_exists=closing_entry_exists,
             )
 
-            if commit:
-                self.save(update_fields=[
-                    'last_closing_date',
-                    'meta',
-                    'updated'
-                ])
-            return ce_model, ce_txs
+            if post_closing_entry:
+                closing_entry_model.mark_as_posted(commit=True)
+                self.save_closing_entry_dates_meta(commit=True)
+
+            return closing_entry_model, ce_txs
         raise EntityModelValidationError(message=f'Closing Entry for Period {closing_date} already exists.')
 
-    def close_books_for_month(self, year: int, month: int, force_update: bool = False, commit: bool = True):
+    def close_books_for_month(self, year: int, month: int, force_update: bool = False, post_closing_entry: bool = True):
         _, day = monthrange(year, month)
         closing_dt = date(year, month, day)
-        return self.close_entity_books(closing_date=closing_dt, force_update=force_update, commit=commit)
+        return self.close_entity_books(
+            closing_date=closing_dt,
+            force_update=force_update,
+            post_closing_entry=post_closing_entry,
+            closing_entry_model=None
+        )
 
-    def close_books_for_fiscal_year(self, fiscal_year: int, force_update: bool = False, commit: bool = True):
+    def close_books_for_fiscal_year(self, fiscal_year: int, force_update: bool = False,
+                                    post_closing_entry: bool = True):
         closing_dt = self.get_fy_end(year=fiscal_year)
-        return self.close_entity_books(closing_date=closing_dt, force_update=force_update, commit=commit)
+        return self.close_entity_books(closing_date=closing_dt, force_update=force_update,
+                                       post_closing_entry=post_closing_entry)
 
     # ### RANDOM DATA GENERATION ####
 
@@ -2692,6 +2884,12 @@ class EntityModelAbstract(MP_Node,
         data_generator.populate_entity()
 
     # URLS ----
+    def get_absolute_url(self):
+        return reverse(viewname='django_ledger:entity-dashboard',
+                       kwargs={
+                           'entity_slug': self.slug
+                       })
+
     def get_dashboard_url(self) -> str:
         """
         The EntityModel Dashboard URL.
@@ -2832,6 +3030,30 @@ class EntityModelAbstract(MP_Node,
                            'entity_slug': self.slug
                        })
 
+    def get_coa_list_url(self) -> str:
+        return reverse(
+            viewname='django_ledger:coa-list',
+            kwargs={
+                'entity_slug': self.slug
+            }
+        )
+
+    def get_coa_list_inactive_url(self) -> str:
+        return reverse(
+            viewname='django_ledger:coa-list-inactive',
+            kwargs={
+                'entity_slug': self.slug
+            }
+        )
+
+    def get_coa_create_url(self) -> str:
+        return reverse(
+            viewname='django_ledger:coa-create',
+            kwargs={
+                'entity_slug': self.slug
+            }
+        )
+
     def get_accounts_url(self) -> str:
         """
         The EntityModel Code of Accounts llist import URL.
@@ -2898,10 +3120,14 @@ class EntityModel(EntityModelAbstract):
     """
     Entity Model Base Class From Abstract
     """
+    class Meta(EntityModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_ENTITY_MODEL'
+        abstract = False
+
 
 
 # ## ENTITY STATE....
-class EntityStateModelAbstract(models.Model):
+class EntityStateModelAbstract(Model):
     KEY_JOURNAL_ENTRY = 'je'
     KEY_PURCHASE_ORDER = 'po'
     KEY_BILL = 'bill'
@@ -2954,13 +3180,17 @@ class EntityStateModelAbstract(models.Model):
         ]
 
     def __str__(self):
-        return f'{self.__class__.__name__} {self.entity_id}: FY: {self.fiscal_year}, KEY: {self.get_key_display()}'
+        return f'{self.__class__.__name__} {self.entity_model_id}: FY: {self.fiscal_year}, KEY: {self.get_key_display()}'
 
 
 class EntityStateModel(EntityStateModelAbstract):
     """
     Entity State Model Base Class from Abstract.
     """
+
+    class Meta(EntityStateModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_ENTITY_STATE_MODEL'
+        abstract = False
 
 
 # ## ENTITY MANAGEMENT.....

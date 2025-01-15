@@ -2,9 +2,6 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
-
 The EstimateModel provides the means to estimate customer requests, jobs or quotes that may ultimately be considered
 contracts, if approved. The EstimateModels will estimate revenues and costs associated with a specific scope of work
 which is documented using ItemTransactionModels.
@@ -27,15 +24,23 @@ from django.db.models import Q, Sum, ExpressionWrapper, FloatField, F
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
-from django.utils.timezone import localdate
 from django.utils.translation import gettext_lazy as _
 
+from django_ledger.io.io_core import get_localdate
 from django_ledger.models import BillModelQuerySet, InvoiceModelQuerySet
 from django_ledger.models.customer import CustomerModel
 from django_ledger.models.entity import EntityModel, EntityStateModel
 from django_ledger.models.items import ItemTransactionModelQuerySet, ItemTransactionModel, ItemModelQuerySet, ItemModel
 from django_ledger.models.mixins import CreateUpdateMixIn, MarkdownNotesMixIn, ItemizeMixIn
 from django_ledger.models.purchase_order import PurchaseOrderModelQuerySet
+from django_ledger.models.signals import (
+    estimate_status_void,
+    estimate_status_draft,
+    estimate_status_approved,
+    estimate_status_canceled,
+    estimate_status_completed,
+    estimate_status_in_review
+)
 from django_ledger.settings import DJANGO_LEDGER_DOCUMENT_NUMBER_PADDING, DJANGO_LEDGER_ESTIMATE_NUMBER_PREFIX
 
 ESTIMATE_NUMBER_CHARS = ascii_uppercase + digits
@@ -111,6 +116,15 @@ class EstimateModelManager(models.Manager):
     A custom defined EstimateModelManager that that implements custom QuerySet methods related to the EstimateModel.
     """
 
+    def for_user(self, user_model):
+        qs = self.get_queryset()
+        if user_model.is_superuser:
+            return qs
+        return qs.filter(
+            Q(entity__admin=user_model) |
+            Q(entity__managers__in=[user_model])
+        )
+
     def for_entity(self, entity_slug: Union[EntityModel, str], user_model):
         """
         Fetches a QuerySet of EstimateModels associated with a specific EntityModel & UserModel.
@@ -123,30 +137,18 @@ class EstimateModelManager(models.Manager):
         user_model
             Logged in and authenticated django UserModel instance.
 
-        Examples
-        --------
-            >>> request_user = request.user
-            >>> slug = kwargs['entity_slug'] # may come from request kwargs
-            >>> bill_model_qs = EstimateModel.objects.for_entity(user_model=request_user, entity_slug=slug)
-
         Returns
         -------
         EstimateModelQuerySet
             Returns a EstimateModelQuerySet with applied filters.
         """
-        qs = self.get_queryset()
+        qs = self.for_user(user_model)
         if isinstance(entity_slug, EntityModel):
             return qs.filter(
-                Q(entity=entity_slug) & (
-                        Q(entity__admin=user_model) |
-                        Q(entity__managers__in=[user_model])
-                )
+                Q(entity=entity_slug)
             )
         return qs.filter(
-            Q(entity__slug__exact=entity_slug) & (
-                    Q(entity__admin=user_model) |
-                    Q(entity__managers__in=[user_model])
-            )
+            Q(entity__slug__exact=entity_slug)
         )
 
 
@@ -392,7 +394,7 @@ class EstimateModelAbstract(CreateUpdateMixIn,
 
             self.customer = customer_model
             if not date_draft:
-                self.date_draft = localdate()
+                self.date_draft = get_localdate()
 
             self.clean()
             self.clean_fields()
@@ -607,7 +609,7 @@ class EstimateModelAbstract(CreateUpdateMixIn,
 
     # Actions...
     # DRAFT...
-    def mark_as_draft(self, commit: bool = False):
+    def mark_as_draft(self, commit: bool = False, raise_exception: bool = True, **kwargs):
         """
         Marks the current EstimateModel instance as Draft.
 
@@ -617,7 +619,9 @@ class EstimateModelAbstract(CreateUpdateMixIn,
             Commits transaction into current EstimateModel instance.
         """
         if not self.can_draft():
-            raise EstimateModelValidationError(f'Estimate {self.estimate_number} cannot be marked as draft...')
+            if raise_exception:
+                raise EstimateModelValidationError(f'Estimate {self.estimate_number} cannot be marked as draft...')
+            return
         self.status = self.CONTRACT_STATUS_DRAFT
         self.clean()
         if commit:
@@ -625,6 +629,10 @@ class EstimateModelAbstract(CreateUpdateMixIn,
                 'status',
                 'updated'
             ])
+        estimate_status_draft.send_robust(sender=self.__class__,
+                                          instance=self,
+                                          commited=commit,
+                                          **kwargs)
 
     def get_mark_as_draft_html_id(self):
         """
@@ -667,7 +675,10 @@ class EstimateModelAbstract(CreateUpdateMixIn,
     def mark_as_review(self,
                        itemtxs_qs: Optional[ItemTransactionModelQuerySet] = None,
                        date_in_review: Optional[date] = None,
-                       commit: bool = True):
+                       raise_exception: bool = True,
+                       commit: bool = True,
+                       **kwargs):
+
         """
         Marks the current EstimateModel instance as In Review.
 
@@ -682,7 +693,9 @@ class EstimateModelAbstract(CreateUpdateMixIn,
             Optional date when EstimateModel instance is In Review. Defaults to localdate().
         """
         if not self.can_review():
-            raise ValidationError(f'Estimate {self.estimate_number} cannot be marked as In Review...')
+            if raise_exception:
+                raise ValidationError(f'Estimate {self.estimate_number} cannot be marked as In Review...')
+            return
 
         if not itemtxs_qs:
             itemtxs_qs = self.itemtransactionmodel_set.all()
@@ -697,7 +710,7 @@ class EstimateModelAbstract(CreateUpdateMixIn,
             raise EstimateModelValidationError(message='Revenue amount is zero!.')
 
         if not date_in_review:
-            date_in_review = localdate()
+            date_in_review = get_localdate()
         self.date_in_review = date_in_review
         self.status = self.CONTRACT_STATUS_REVIEW
         self.clean()
@@ -707,6 +720,10 @@ class EstimateModelAbstract(CreateUpdateMixIn,
                 'status',
                 'updated'
             ])
+        estimate_status_in_review.send_robust(sender=self.__class__,
+                                              instance=self,
+                                              commited=commit,
+                                              **kwargs)
 
     def get_mark_as_review_html_id(self):
         """
@@ -746,7 +763,11 @@ class EstimateModelAbstract(CreateUpdateMixIn,
         return _('Do you want to mark Estimate %s as In Review?') % self.estimate_number
 
     # APPROVED
-    def mark_as_approved(self, commit=False, date_approved: Optional[date] = None):
+    def mark_as_approved(self,
+                         commit=False,
+                         date_approved: Optional[date] = None,
+                         raise_exception: bool = True,
+                         **kwargs):
         """
         Marks the current EstimateModel instance as Approved.
 
@@ -758,11 +779,14 @@ class EstimateModelAbstract(CreateUpdateMixIn,
             Optional date when EstimateModel instance is Approved. Defaults to localdate().
         """
         if not self.can_approve():
-            raise EstimateModelValidationError(
-                f'Estimate {self.estimate_number} cannot be marked as approved.'
-            )
+            if raise_exception:
+                raise EstimateModelValidationError(
+                    f'Estimate {self.estimate_number} cannot be marked as approved.'
+                )
+            return
+
         if not date_approved:
-            date_approved = localdate()
+            date_approved = get_localdate()
         self.date_approved = date_approved
         self.status = self.CONTRACT_STATUS_APPROVED
         self.clean()
@@ -772,6 +796,10 @@ class EstimateModelAbstract(CreateUpdateMixIn,
                 'date_approved',
                 'updated'
             ])
+        estimate_status_approved.send_robust(sender=self.__class__,
+                                             instance=self,
+                                             commited=commit,
+                                             **kwargs)
 
     def get_mark_as_approved_html_id(self):
         """
@@ -811,7 +839,11 @@ class EstimateModelAbstract(CreateUpdateMixIn,
         return _('Do you want to mark Estimate %s as Approved?') % self.estimate_number
 
     # COMPLETED
-    def mark_as_completed(self, commit=False, date_completed: Optional[date] = None):
+    def mark_as_completed(self,
+                          commit=False,
+                          date_completed: Optional[date] = None,
+                          raise_exception: bool = True,
+                          **kwargs):
         """
         Marks the current EstimateModel instance as Completed.
 
@@ -823,19 +855,28 @@ class EstimateModelAbstract(CreateUpdateMixIn,
             Optional date when EstimateModel instance is completed. Defaults to localdate().
         """
         if not self.can_complete():
-            raise EstimateModelValidationError(f'Estimate {self.estimate_number} cannot be marked as completed.')
+            if raise_exception:
+                raise EstimateModelValidationError(f'Estimate {self.estimate_number} cannot be marked as completed.')
+            return
         if not date_completed:
-            date_completed = localdate()
+            date_completed = get_localdate()
         self.date_completed = date_completed
         self.status = self.CONTRACT_STATUS_COMPLETED
         self.clean()
         if commit:
             self.clean()
-            self.save(update_fields=[
-                'status',
-                'date_completed',
-                'updated'
-            ])
+            self.save(
+                update_fields=[
+                    'status',
+                    'date_completed',
+                    'updated'
+                ])
+        estimate_status_completed.send_robust(
+            sender=self.__class__,
+            instance=self,
+            commited=commit,
+            **kwargs
+        )
 
     def get_mark_as_completed_html_id(self):
         """
@@ -875,7 +916,11 @@ class EstimateModelAbstract(CreateUpdateMixIn,
         return _('Do you want to mark Estimate %s as Completed?') % self.estimate_number
 
     # CANCEL
-    def mark_as_canceled(self, commit: bool = False, date_canceled: Optional[date] = None):
+    def mark_as_canceled(self,
+                         commit: bool = False,
+                         date_canceled: Optional[date] = None,
+                         raise_exception: bool = True,
+                         **kwargs):
         """
         Marks the current EstimateModel instance as Canceled.
 
@@ -887,9 +932,11 @@ class EstimateModelAbstract(CreateUpdateMixIn,
             Optional date when EstimateModel instance is canceled. Defaults to localdate().
         """
         if not self.can_cancel():
-            raise EstimateModelValidationError(f'Estimate {self.estimate_number} cannot be canceled...')
+            if raise_exception:
+                raise EstimateModelValidationError(f'Estimate {self.estimate_number} cannot be canceled...')
+            return
         if not date_canceled:
-            date_canceled = localdate()
+            date_canceled = get_localdate()
         self.date_canceled = date_canceled
         self.status = self.CONTRACT_STATUS_CANCELED
         self.clean()
@@ -899,6 +946,12 @@ class EstimateModelAbstract(CreateUpdateMixIn,
                 'date_canceled',
                 'updated'
             ])
+        estimate_status_canceled.send_robust(
+            sender=self.__class__,
+            instance=self,
+            commited=commit,
+            **kwargs
+        )
 
     def get_mark_as_canceled_html_id(self):
         """
@@ -938,7 +991,12 @@ class EstimateModelAbstract(CreateUpdateMixIn,
         return _('Do you want to mark Estimate %s as Canceled?') % self.estimate_number
 
     # VOID
-    def mark_as_void(self, commit: bool = False, date_void: Optional[date] = None):
+    def mark_as_void(self,
+                     commit: bool = False,
+                     date_void: Optional[date] = None,
+                     raise_exception: bool = True,
+                     **kwargs):
+
         """
         Marks the current EstimateModel instance as Void.
 
@@ -950,9 +1008,12 @@ class EstimateModelAbstract(CreateUpdateMixIn,
             Optional date when EstimateModel instance is void. Defaults to localdate().
         """
         if not self.can_void():
-            raise EstimateModelValidationError(f'Estimate {self.estimate_number} cannot be void...')
+            if raise_exception:
+                raise EstimateModelValidationError(f'Estimate {self.estimate_number} cannot be void...')
+            return
+
         if not date_void:
-            date_void = localdate()
+            date_void = get_localdate()
         self.date_void = date_void
         self.status = self.CONTRACT_STATUS_VOID
         self.clean()
@@ -962,6 +1023,12 @@ class EstimateModelAbstract(CreateUpdateMixIn,
                 'date_void',
                 'updated'
             ])
+        estimate_status_void.send_robust(
+            sender=self.__class__,
+            instance=self,
+            commited=commit,
+            **kwargs
+        )
 
     def get_mark_as_void_html_id(self):
         """
@@ -1520,16 +1587,16 @@ class EstimateModelAbstract(CreateUpdateMixIn,
     def clean(self):
 
         if not self.date_draft:
-            self.date_draft = localdate()
+            self.date_draft = get_localdate()
 
         if self.can_generate_estimate_number():
             self.generate_estimate_number(commit=False)
 
         if self.is_approved() and not self.date_approved:
-            self.date_approved = localdate()
+            self.date_approved = get_localdate()
 
         if self.is_completed() and not self.date_completed:
-            self.date_completed = localdate()
+            self.date_completed = get_localdate()
 
         if self.is_canceled():
             self.date_approved = None
@@ -1545,3 +1612,7 @@ class EstimateModel(EstimateModelAbstract):
     """
     Base EstimateModel Class.
     """
+
+    class Meta(EstimateModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_ESTIMATE_MODEL'
+        abstract = False

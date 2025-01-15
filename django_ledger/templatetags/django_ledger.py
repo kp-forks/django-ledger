@@ -13,13 +13,12 @@ from django import template
 from django.db.models import Sum
 from django.urls import reverse
 from django.utils.formats import number_format
-from django.utils.timezone import localdate
 
 from django_ledger import __version__
 from django_ledger.forms.app_filters import EntityFilterForm, ActivityFilterForm
 from django_ledger.forms.feedback import BugReportForm, RequestNewFeatureForm
 from django_ledger.io import CREDIT, DEBIT, ROLES_ORDER_ALL
-from django_ledger.io.io_mixin import validate_activity
+from django_ledger.io.io_core import validate_activity, get_localdate
 from django_ledger.models import TransactionModel, BillModel, InvoiceModel, EntityUnitModel
 from django_ledger.settings import (
     DJANGO_LEDGER_FINANCIAL_ANALYSIS, DJANGO_LEDGER_CURRENCY_SYMBOL,
@@ -49,6 +48,14 @@ def absolute(value):
         return abs(value)
 
 
+@register.filter(name='reverse_sign')
+def reverse_sign(value):
+    if value:
+        if isinstance(value, str):
+            value = float(value)
+        return -value
+
+
 @register.filter(name='currency_format')
 def currency_format(value):
     if not value:
@@ -60,13 +67,6 @@ def currency_format(value):
 def percentage(value):
     if value is not None:
         return '{0:,.2f}%'.format(value * 100)
-
-
-@register.filter(name='reverse_sing')
-def reverse_sign(value: float):
-    if value:
-        return -value
-    return 0
 
 
 @register.filter(name='last_four')
@@ -106,7 +106,9 @@ def balance_sheet_statement(context, io_model, to_date=None):
         balance_sheet_statement=True)
 
     return {
-        'tx_digest': io_digest.get_io_data()
+        'entity_slug': entity_slug,
+        'user_model': user_model,
+        'tx_digest': io_digest.get_io_data(),
     }
 
 
@@ -131,13 +133,15 @@ def cash_flow_statement(context, io_model):
         process_groups=True)
 
     return {
+        'entity_slug': entity_slug,
+        'user_model': user_model,
         'tx_digest': io_digest.get_io_data()
     }
 
 
 @register.inclusion_tag('django_ledger/financial_statements/tags/income_statement.html', takes_context=True)
 def income_statement_table(context, io_model, from_date=None, to_date=None):
-    user_model: EntityUnitModel = context['user']
+    user_model = context['user']
     activity = context['request'].GET.get('activity')
     activity = validate_activity(activity, raise_404=True)
     entity_slug = context['view'].kwargs.get('entity_slug')
@@ -162,6 +166,8 @@ def income_statement_table(context, io_model, from_date=None, to_date=None):
     )
 
     return {
+        'entity_slug': entity_slug,
+        'user_model': user_model,
         'tx_digest': io_digest.get_io_data()
     }
 
@@ -389,10 +395,12 @@ def default_entity(context):
 def session_entity_name(context, request=None):
     session_key = get_default_entity_session_key()
     if not request:
-        request = context['request']
-    session = request.session
+        request = context.get('request')
     try:
+        session = request.session
         entity_name = session.get(session_key)['entity_name']
+    except AttributeError:
+        entity_name = 'Django Ledger'
     except KeyError:
         entity_name = 'Django Ledger'
     except TypeError:
@@ -542,6 +550,9 @@ def period_navigation(context, base_url: str):
     if context['view'].kwargs.get('unit_slug'):
         kwargs['unit_slug'] = context['view'].kwargs.get('unit_slug')
 
+    if context['view'].kwargs.get('coa_slug'):
+        kwargs['coa_slug'] = context['view'].kwargs.get('coa_slug')
+
     ctx = dict()
     ctx['year'] = context['year']
     ctx['has_year'] = context.get('has_year')
@@ -560,18 +571,22 @@ def period_navigation(context, base_url: str):
     kwargs['year'] = context['year']
     ctx['current_year_url'] = reverse(f'django_ledger:{base_url}-year', kwargs=kwargs)
 
-    dt = localdate()
+    dt = get_localdate()
+
     KWARGS_CURRENT_MONTH = {
         'entity_slug': context['view'].kwargs['entity_slug'],
         'year': dt.year,
         'month': dt.month
     }
+
     if 'unit_slug' in kwargs:
         KWARGS_CURRENT_MONTH['unit_slug'] = kwargs['unit_slug']
     if 'account_pk' in kwargs:
         KWARGS_CURRENT_MONTH['account_pk'] = kwargs['account_pk']
     if 'ledger_pk' in kwargs:
         KWARGS_CURRENT_MONTH['ledger_pk'] = kwargs['ledger_pk']
+    if 'coa_slug' in kwargs:
+        KWARGS_CURRENT_MONTH['coa_slug'] = kwargs['coa_slug']
 
     ctx['current_month_url'] = reverse(f'django_ledger:{base_url}-month',
                                        kwargs=KWARGS_CURRENT_MONTH)
@@ -737,12 +752,12 @@ def navigation_menu(context, style):
                     {
                         'type': 'link',
                         'title': 'Chart of Accounts',
-                        'url': reverse('django_ledger:account-list', kwargs={'entity_slug': ENTITY_SLUG})
+                        'url': reverse('django_ledger:coa-list', kwargs={'entity_slug': ENTITY_SLUG})
                     },
                     {
                         'type': 'link',
                         'title': 'Ledgers',
-                        'url': reverse('django_ledger:ledger-list', kwargs={'entity_slug': ENTITY_SLUG})
+                        'url': reverse('django_ledger:ledger-list-visible', kwargs={'entity_slug': ENTITY_SLUG})
                     },
                     {
                         'type': 'link',

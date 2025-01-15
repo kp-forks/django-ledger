@@ -3,7 +3,7 @@ Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
 Contributions to this module:
-Miguel Sanda <msanda@arrobalytics.com>
+    * Miguel Sanda <msanda@arrobalytics.com>
 """
 
 from datetime import timedelta
@@ -12,13 +12,17 @@ from random import randint
 
 from django.http import HttpResponseRedirect
 from django.urls import reverse
-from django.utils.timezone import localdate, localtime
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import ListView, DetailView, UpdateView, CreateView, RedirectView, DeleteView
 
 from django_ledger.forms.entity import EntityModelUpdateForm, EntityModelCreateForm
-from django_ledger.io.data_generator import EntityDataGenerator
-from django_ledger.models import (EntityModel, ItemTransactionModel, TransactionModel)
+from django_ledger.io.io_core import get_localdate, get_localtime
+from django_ledger.io.io_generator import EntityDataGenerator
+from django_ledger.models import (
+    EntityModel,
+    ItemTransactionModel,
+    TransactionModel
+)
 from django_ledger.views.mixins import (
     QuarterlyReportMixIn, YearlyReportMixIn,
     MonthlyReportMixIn, DateReportMixIn, DjangoLedgerSecurityMixIn, EntityUnitMixIn,
@@ -94,10 +98,10 @@ class EntityModelCreateView(DjangoLedgerSecurityMixIn, EntityModelModelViewQuery
             entity_generator = EntityDataGenerator(
                 entity_model=entity_model,
                 user_model=self.request.user,
-                start_dttm=localtime() - timedelta(days=30 * 8),
+                start_dttm=get_localtime() - timedelta(days=30 * 8),
                 capital_contribution=Decimal.from_float(50000),
                 days_forward=30 * 7,
-                tx_quantity=cleaned_data['tx_quantity']
+                tx_quantity=50
             )
             entity_generator.populate_entity()
 
@@ -155,12 +159,12 @@ class EntityDeleteView(DjangoLedgerSecurityMixIn, EntityModelModelViewQuerySetMi
 
 
 # DASHBOARD VIEWS START ----
-class EntityModelDetailView(DjangoLedgerSecurityMixIn,
-                            EntityUnitMixIn,
-                            RedirectView):
+class EntityModelDetailHandlerView(DjangoLedgerSecurityMixIn,
+                                   EntityUnitMixIn,
+                                   RedirectView):
 
     def get_redirect_url(self, *args, **kwargs):
-        loc_date = localdate()
+        loc_date = get_localdate()
         unit_slug = self.get_unit_slug()
         if unit_slug:
             return reverse('django_ledger:unit-dashboard-month',
@@ -178,14 +182,14 @@ class EntityModelDetailView(DjangoLedgerSecurityMixIn,
                        })
 
 
-class FiscalYearEntityModelDashboardView(DjangoLedgerSecurityMixIn,
-                                         EntityModelModelViewQuerySetMixIn,
-                                         BaseDateNavigationUrlMixIn,
-                                         UnpaidElementsMixIn,
-                                         EntityUnitMixIn,
-                                         DigestContextMixIn,
-                                         YearlyReportMixIn,
-                                         DetailView):
+class EntityModelDetailBaseView(DjangoLedgerSecurityMixIn,
+                                EntityModelModelViewQuerySetMixIn,
+                                BaseDateNavigationUrlMixIn,
+                                UnpaidElementsMixIn,
+                                EntityUnitMixIn,
+                                DigestContextMixIn,
+                                YearlyReportMixIn,
+                                DetailView):
     context_object_name = 'entity'
     slug_url_kwarg = 'entity_slug'
     template_name = 'django_ledger/entity/entity_dashboard.html'
@@ -195,11 +199,11 @@ class FiscalYearEntityModelDashboardView(DjangoLedgerSecurityMixIn,
     FETCH_UNPAID_BILLS = True
     FETCH_UNPAID_INVOICES = True
 
-    IO_DIGEST = True
-    IO_DIGEST_EQUITY = True
+    IO_DIGEST_UNBOUNDED = True
+    IO_DIGEST_BOUNDED = True
 
     def get_context_data(self, **kwargs):
-        context = super(FiscalYearEntityModelDashboardView, self).get_context_data(**kwargs)
+        context = super().get_context_data(**kwargs)
         entity_model: EntityModel = self.object
         context['page_title'] = entity_model.name
         context['header_title'] = entity_model.name
@@ -222,6 +226,12 @@ class FiscalYearEntityModelDashboardView(DjangoLedgerSecurityMixIn,
                                                         kwargs=KWARGS)
 
         return context
+
+
+class FiscalYearEntityModelDashboardView(EntityModelDetailBaseView):
+    """
+    Entity Fiscal Year Dashboard View.
+    """
 
 
 class QuarterlyEntityDashboardView(FiscalYearEntityModelDashboardView, QuarterlyReportMixIn):

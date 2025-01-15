@@ -2,10 +2,6 @@
 Django Ledger created by Miguel Sanda <msanda@arrobalytics.com>.
 Copyright© EDMA Group Inc licensed under the GPLv3 Agreement.
 
-Contributions to this module:
-    * Miguel Sanda <msanda@arrobalytics.com>
-    * Pranav P Tulshyan <ptulshyan77@gmail.com>
-
 A Customer refers to the person or entity that buys product and services. When issuing Invoices, a Customer must be
 created before it can be assigned to the InvoiceModel. Only customers who are active can be assigned to new Invoices.
 """
@@ -14,7 +10,7 @@ from uuid import uuid4
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models, transaction, IntegrityError
-from django.db.models import Q, F, QuerySet
+from django.db.models import Q, F, QuerySet, Manager
 from django.utils.translation import gettext_lazy as _
 
 from django_ledger.models.mixins import ContactInfoMixIn, CreateUpdateMixIn, TaxCollectionMixIn
@@ -81,7 +77,7 @@ class CustomerModelQueryset(QuerySet):
         )
 
 
-class CustomerModelManager(models.Manager):
+class CustomerModelManager(Manager):
     """
     A custom defined CustomerModelManager that will act as an interface to handling the DB queries to the
     CustomerModel.
@@ -107,6 +103,8 @@ class CustomerModelManager(models.Manager):
             >>> customer_model_qs = CustomerModel.objects.for_user(user_model=request_user)
         """
         qs = self.get_queryset()
+        if user_model.is_superuser:
+            return qs
         return qs.filter(
             Q(entity__admin=user_model) |
             Q(entity__managers__in=[user_model])
@@ -135,22 +133,14 @@ class CustomerModelManager(models.Manager):
         CustomerModelQueryset
             A filtered CustomerModel QuerySet.
         """
-        qs = self.get_queryset()
+        qs = self.for_user(user_model)
 
         if isinstance(entity_slug, lazy_loader.get_entity_model()):
             return qs.filter(
-                Q(entity_model=entity_slug) &
-                (
-                        Q(entity_model__admin=user_model) |
-                        Q(entity_model__managers__in=[user_model])
-                )
+                Q(entity_model=entity_slug)
             )
         return qs.filter(
-            Q(entity_model__slug__exact=entity_slug) &
-            (
-                    Q(entity_model__admin=user_model) |
-                    Q(entity_model__managers__in=[user_model])
-            )
+            Q(entity_model__slug__exact=entity_slug)
         )
 
 
@@ -339,3 +329,7 @@ class CustomerModel(CustomerModelAbstract):
     """
     Base Customer Model Implementation
     """
+
+    class Meta(CustomerModelAbstract.Meta):
+        swappable = 'DJANGO_LEDGER_CUSTOMER_MODEL'
+        abstract = False

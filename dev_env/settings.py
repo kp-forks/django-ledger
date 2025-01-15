@@ -92,12 +92,11 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-# TIME_ZONE = 'US/Eastern'
+USE_TZ = True
 TIME_ZONE = 'US/Eastern'
 
 USE_I18N = True
 USE_L10N = True
-USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/2.2/howto/static-files/
@@ -117,6 +116,10 @@ if DJANGO_LEDGER_GRAPHQL_SUPPORT_ENABLED:
         # 'MIDDLEWARE': [
         #     'graphql_jwt.middleware.JSONWebTokenMiddleware',
         # ],
+    }
+
+    OAUTH2_PROVIDER = {
+        'OAUTH2_BACKEND_CLASS': 'oauth2_provider.oauth2_backends.JSONOAuthLibCore',
     }
 
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'

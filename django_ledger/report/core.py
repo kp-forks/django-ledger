@@ -3,8 +3,9 @@ from typing import Optional, Dict
 from django.contrib.staticfiles import finders
 from django.core.exceptions import ValidationError
 
-from django_ledger.io import IODigestContextManager
-from django_ledger.models import LedgerModel, EntityUnitModel
+from django_ledger.io.io_context import IODigestContextManager
+from django_ledger.models.ledger import LedgerModel
+from django_ledger.models.unit import EntityUnitModel
 from django_ledger.settings import DJANGO_LEDGER_PDF_SUPPORT_ENABLED
 from django_ledger.templatetags.django_ledger import currency_symbol, currency_format
 
@@ -104,8 +105,8 @@ class BaseReportSupport(*load_support()):
             style='I'
         )
 
-        from_date = self.IO_DIGEST.get_from_date(as_str=True)
-        to_date = self.IO_DIGEST.get_to_date(as_str=True)
+        from_date = self.IO_DIGEST.get_from_datetime(as_str=True)
+        to_date = self.IO_DIGEST.get_to_datetime(as_str=True)
 
         if from_date and to_date:
             period = f'From {from_date} through {to_date}'
